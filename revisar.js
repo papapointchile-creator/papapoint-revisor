@@ -54,8 +54,7 @@ async function debug(page, nombre) {
       `${e.tagName.toLowerCase()} type=${e.type || ''} name=${e.name || ''} placeholder=${e.placeholder || ''} texto=${(e.innerText || '').trim().slice(0, 30)}`
     )).catch(() => []);
     console.log(`[debug ${nombre}] url=${page.url().split('?')[0]}`);
-    console.log(`[debug ${nombre}] texto: ${txt.replace(/\s+/g, ' ').slice(0, 400)}`);
-    console.log(`[debug ${nombre}] campos:\n  ` + campos.join('\n  '));
+    if (/\/login/.test(page.url())) console.log(`[debug ${nombre}] campos de la pantalla de login:\n  ` + campos.join('\n  '));
   } catch {}
 }
 
@@ -71,14 +70,23 @@ async function iniciarSesion(page) {
   await clave.waitFor({ timeout: 30000 });
   await page.waitForTimeout(1000);
   const usuario = page.locator('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio])').first();
-  await usuario.fill(USER);
-  await clave.fill(PASS);
+  await usuario.fill(USER.trim());
+  await clave.fill(PASS.trim());
+  // Solo anota avisos de error de la pantalla de login (cajitas tipo "toast"), nunca datos de la cuenta
+  const vistos = new Set();
+  const espia = setInterval(async () => {
+    if (!/\/login/.test(page.url())) return;
+    const avisos = await page.$$eval('[class*="toast"], [class*="error"], [class*="message"], [role="alert"]',
+      els => els.map(e => (e.innerText || '').trim()).filter(t => t && t.length < 80)).catch(() => []);
+    for (const a of avisos) if (!vistos.has(a)) { vistos.add(a); console.log('[aviso en la pantalla de login] ' + a); }
+  }, 300);
   const boton = page.locator([
     'button[type=submit]', 'button:has-text("Iniciar")', 'button:has-text("Ingresar")',
     'button:has-text("Entrar")', 'button:has-text("Login")', 'button:has-text("Log in")', 'button:has-text("Sign in")',
   ].join(', ')).first();
   if (await boton.count()) await boton.click(); else await clave.press('Enter');
-  await page.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 30000 }).catch(() => {});
+  await page.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 20000 }).catch(() => {});
+  clearInterval(espia);
   return !(await enLogin(page));
 }
 
