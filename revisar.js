@@ -68,6 +68,8 @@ async function iniciarSesion(page) {
   await page.goto(BASE + '/login', { waitUntil: 'networkidle' }).catch(() => {});
   const clave = page.locator('input[type=password]').first();
   await clave.waitFor({ timeout: 30000 });
+  // La página parte en chino: elegir Español para que los textos calcen
+  await page.locator('select').first().selectOption({ label: 'Español' }).catch(() => {});
   await page.waitForTimeout(1000);
   const usuario = page.locator('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio])').first();
   await usuario.fill(USER.trim());
@@ -108,9 +110,9 @@ async function leerMaquinas(page) {
   for (const bloque of txt.split(/(?=\b[A-Z]{3,}\d{6,}\b)/)) {
     const id = (bloque.match(/#(M\d{3})/) || [])[1];
     if (!id) continue;
-    const online = /Fuera de l[ií]nea|Offline/i.test(bloque) ? false
-      : (/En l[ií]nea|Online/i.test(bloque) ? true : null);
-    const al = bloque.match(/(?:Alerta|Alert|Alarm)\s*:?\s*(\d{1,3})\b/i);
+    const online = /Fuera de l[ií]nea|Offline|离线/i.test(bloque) ? false
+      : (/En l[ií]nea|Online|在线/i.test(bloque) ? true : null);
+    const al = bloque.match(/(?:Alerta|Alert|Alarm|告警|报警|警报)\s*:?\s*(\d{1,3})\b/i);
     maq[id] = { online, alerta: al ? al[1] : null };
   }
   return maq;
@@ -133,8 +135,14 @@ async function leerMaquinas(page) {
     if (await iniciarSesion(page)) maq = await leerMaquinas(page);
     if (maq === null) { loginFallo = true; await debug(page, 'login'); }
   }
-  const hay = maq && Object.keys(maq).length > 0;
+  let hay = maq && Object.keys(maq).length > 0;
   if (maq && !hay) await debug(page, 'sin-maquinas');
+  // Si no se pudo leer si están en línea, mejor no avisar nada (evita mensajes falsos)
+  if (hay && Object.values(maq).some(m => m.online === null)) {
+    await debug(page, 'sin-estado');
+    await browser.close();
+    throw new Error('Leí las máquinas pero no entendí si están en línea (cambió el idioma o la pantalla)');
+  }
   if (hay) guardarSesion(await ctx.storageState());
   await browser.close();
 
