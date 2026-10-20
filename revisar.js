@@ -19,6 +19,10 @@ const AVISOS = 'https://www.papapoint.cl/pp-alertas.php';
 const REVISOR = 'https://www.papapoint.cl/pp-revisor.php';
 const SESION = '.sesion/state.bin';   // sesiones guardadas (cifradas) para no iniciar sesión en cada corrida
 const ESTADO = 'estado.json';         // último estado de conexión y alertas, queda en el repositorio
+const VENTAS_ENC = 'ventas.enc';      // ventas por día y máquina, CIFRADAS (el repositorio es público)
+const POS_MAQ = { '846000190': 'M001', '846000189': 'M002', '846000188': 'M003' };   // Serial POS en PayScan → máquina
+// Llave PÚBLICA: solo sirve para cifrar. La privada (para leer) está solo en la tarea que carga Logística.
+const VENTAS_PUB = '-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjXpzd2JJYpRkwQbdbFoO\njvgWLfpJ1TuoarrsHmYAQo+zuypOLDf15m5ABY1uHazmARYXCdO7ditx/zOhXPUy\nc1pZyNO3h+u7zdsnrN/7u3VHeZi9qFpaeAq6aw1pWUc1sa2f2Lg8lRTFreIUVMDU\nBn5McrMnsXZrrzFl6ysSDg+DtrfVPHYLj8u/Wsc/GEUB78hPZ6G7cdbayFxOtmBS\n2GxThjzRN2nGiliOd9UGHnBXPZGGRNtsunH6D+tKjGszTITfGKk8lyVoJe/IoAlX\n1tGUKFxsUCP0ZtcOZtWGfd9h6aJEFjtv/t6BfWwq65RG6AvUTRIndBIASmUOo0jW\nbwIDAQAB\n-----END PUBLIC KEY-----';
 const VM_USER = process.env.VM_USER, VM_PASS = process.env.VM_PASS;
 const ADM_USER = process.env.VMADMIN_USER, ADM_PASS = process.env.VMADMIN_PASS;   // la app de administración tiene su propia clave
 const PS_USER = process.env.PAYSCAN_USER, PS_PASS = process.env.PAYSCAN_PASS;
@@ -35,18 +39,27 @@ function ahoraSantiago() {
   return { dia: `${p.year}-${p.month}-${p.day}`, hora: `${p.hour}:${p.minute}:${p.second}` };
 }
 
+// Cifrado de ventas: AES-256-CBC con llave al azar, y esa llave cifrada con RSA-OAEP (llave pública de arriba).
+function cifrarVentas(obj) {
+  const kv = crypto.randomBytes(48);   // 32 de llave + 16 de iv
+  const c = crypto.createCipheriv('aes-256-cbc', kv.subarray(0, 32), kv.subarray(32));
+  const d = Buffer.concat([c.update(JSON.stringify(obj), 'utf8'), c.final()]);
+  const k = crypto.publicEncrypt({ key: VENTAS_PUB, padding: crypto.constants.RSA_PKCS1_OAEP_PADDING }, kv);
+  return JSON.stringify({ k: k.toString('base64'), d: d.toString('base64') }) + '\n';
+}
+
 // La sesión se guarda cifrada con una llave que sale de la clave (secreto), así nadie más la puede usar.
 const LLAVE = crypto.createHash('sha256').update('pp-sesion|' + (VM_PASS || '')).digest();
-function guardarSesion(obj) {
+function guardarSesion(obj, archivo = SESION) {
   const iv = crypto.randomBytes(12);
   const c = crypto.createCipheriv('aes-256-gcm', LLAVE, iv);
   const datos = Buffer.concat([c.update(JSON.stringify(obj)), c.final()]);
   fs.mkdirSync('.sesion', { recursive: true });
-  fs.writeFileSync(SESION, Buffer.concat([iv, c.getAuthTag(), datos]));
+  fs.writeFileSync(archivo, Buffer.concat([iv, c.getAuthTag(), datos]));
 }
-function leerSesion() {
+function leerSesion(archivo = SESION) {
   try {
-    const b = fs.readFileSync(SESION);
+    const b = fs.readFileSync(archivo);
     const d = crypto.createDecipheriv('aes-256-gcm', LLAVE, b.subarray(0, 12));
     d.setAuthTag(b.subarray(12, 28));
     return JSON.parse(Buffer.concat([d.update(b.subarray(28)), d.final()]).toString());
@@ -275,6 +288,26 @@ async function postear(url, cuerpo, llave) {
     try { viejo = JSON.parse(fs.readFileSync(ESTADO, 'utf8')); } catch {}
     if (!viejo || viejo.dia !== t.dia || JSON.stringify(viejo.maq) !== JSON.stringify(mant)) {
       fs.writeFileSync(ESTADO, JSON.stringify({ dia: t.dia, desde: t.hora, maq: mant }, null, 2) + '\n');
+    }
+  }
+  // Ventas del día en el archivo cifrado (para Logística). El historial se arma con la copia de la corrida
+  // anterior, guardada en el cache de Actions cifrada igual que la sesión (.sesion/ventas.bin).
+  if (informe.ventas) {
+    let h = null;
+    h = leerSesion('.sesion/ventas.bin');
+    if (!h || typeof h.hist !== 'object') h = { hist: {} };
+    const hoy = {};
+    for (const [pos, m] of Object.entries(POS_MAQ)) {
+      const v = informe.ventas[pos] || { n: 0, clp: 0 };
+      hoy[m] = { n: v.n | 0, clp: v.clp | 0 };
+    }
+    if (JSON.stringify(h.hist[t.dia]) !== JSON.stringify(hoy) || !fs.existsSync(VENTAS_ENC)) {
+      h.hist[t.dia] = hoy;
+      const lim = new Date(Date.now() - 62 * 864e5).toISOString().slice(0, 10);
+      for (const d of Object.keys(h.hist)) if (d < lim) delete h.hist[d];
+      h.u = `${t.dia} ${t.hora}`;
+      guardarSesion(h, '.sesion/ventas.bin');
+      fs.writeFileSync(VENTAS_ENC, cifrarVentas(h));
     }
   }
   if (fallas.length >= 2 && !mant && !informe.ventas) throw new Error('No pude leer ninguna de las tres fuentes');
