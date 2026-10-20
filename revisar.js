@@ -87,8 +87,18 @@ async function iniciarSesion(page, urlLogin, user, pass, esLogin) {
     'button[type=submit]', 'button:has-text("Entrar")', 'button:has-text("Iniciar")', 'button:has-text("Ingresar")',
     'button:has-text("Login")', 'button:has-text("Log in")', 'button:has-text("Sign in")', 'button:has-text("登录")',
   ].join(', ')).first();
+  // Solo anota avisos cortos de la pantalla de login (por ejemplo "clave incorrecta") y si aparece una verificación
+  const vistos = new Set();
+  const espia = setInterval(async () => {
+    if (!esLogin(page.url())) return;
+    const avisos = await page.$$eval('[class*="message"], [class*="toast"], [class*="error"], [class*="notice"], [role="alert"]',
+      els => els.map(e => (e.innerText || '').trim()).filter(t => t && t.length < 80)).catch(() => []);
+    const verif = await page.locator('[class*="captcha"], [class*="slider"], [class*="verify"], iframe').count().catch(() => 0);
+    for (const a of avisos.concat(verif ? ['(hay una verificación en pantalla: ' + verif + ')'] : [])) if (!vistos.has(a)) { vistos.add(a); console.log('[aviso en el login] ' + a); }
+  }, 400);
   if (await boton.count()) await boton.click(); else await clave.press('Enter');
   await page.waitForURL(u => !esLogin(u.toString()), { timeout: 20000 }).catch(() => {});
+  clearInterval(espia);
   // La página cambia de dirección antes de sacar el formulario: esperar a que desaparezca
   await page.locator('input[type=password]').first().waitFor({ state: 'detached', timeout: 15000 }).catch(() => {});
   await page.waitForTimeout(1500);
