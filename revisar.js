@@ -20,6 +20,7 @@ const REVISOR = 'https://www.papapoint.cl/pp-revisor.php';
 const SESION = '.sesion/state.bin';   // sesiones guardadas (cifradas) para no iniciar sesión en cada corrida
 const ESTADO = 'estado.json';         // último estado de conexión y alertas, queda en el repositorio
 const VM_USER = process.env.VM_USER, VM_PASS = process.env.VM_PASS;
+const ADM_USER = process.env.VMADMIN_USER, ADM_PASS = process.env.VMADMIN_PASS;   // la app de administración tiene su propia clave
 const PS_USER = process.env.PAYSCAN_USER, PS_PASS = process.env.PAYSCAN_PASS;
 const LLAVE_PP = process.env.PP_LLAVE;
 
@@ -223,17 +224,18 @@ async function postear(url, cuerpo, llave) {
     if (mant) informe.mant = mant; else informe.mantError = 'pidió iniciar sesión y no pude entrar';
   } catch (e) { mant = null; informe.mantError = e.message.slice(0, 100); fallas.push('mantención: ' + e.message); }
 
-  // 2) Administración (mismo usuario y clave que mantención)
-  try {
+  // 2) Administración (usuario y clave propios; si no están en GitHub, se salta para no bloquear la cuenta)
+  if (ADM_USER && ADM_PASS) try {
     let admin = await leerAdmin(page);
     if (admin === null) {
       console.log('Administración: la sesión venció, iniciando sesión');
-      if (await iniciarSesion(page, VM + '/login', VM_USER, VM_PASS, esLoginAdmin)) admin = await leerAdmin(page);
+      if (await iniciarSesion(page, VM + '/login', ADM_USER, ADM_PASS, esLoginAdmin)) admin = await leerAdmin(page);
       if (admin === null) { informe.adminLogin = true; await debug(page, 'administracion-login'); throw new Error('pidió iniciar sesión y no pude entrar'); }
     }
     if (!Object.keys(admin).length) { await debug(page, 'administracion-sin-maquinas'); throw new Error('no encontré máquinas'); }
     informe.admin = admin;
   } catch (e) { informe.adminError = e.message.slice(0, 100); fallas.push('administración: ' + e.message); }
+  else informe.adminError = 'falta guardar su usuario y clave en GitHub';
 
   // 3) PayScan (sin pantallazos: mostrarían ventas)
   try {
@@ -272,5 +274,5 @@ async function postear(url, cuerpo, llave) {
       fs.writeFileSync(ESTADO, JSON.stringify({ dia: t.dia, desde: t.hora, maq: mant }, null, 2) + '\n');
     }
   }
-  if (fallas.length === 3) throw new Error('No pude leer ninguna de las tres fuentes');
+  if (fallas.length >= 2 && !mant && !informe.ventas) throw new Error('No pude leer ninguna de las tres fuentes');
 })().catch(e => { console.error('ERROR: ' + e.message); process.exit(1); });
