@@ -71,7 +71,7 @@ async function debug(page, nombre, conPantallazo = true) {
 }
 
 // ---------- iniciar sesión (formulario de usuario + clave) ----------
-async function iniciarSesion(page, urlLogin, user, pass, esLogin) {
+async function iniciarSesion(page, urlLogin, user, pass, esLogin, marcarRecordar = false) {
   if (!user || !pass) return false;
   await page.goto(urlLogin, { waitUntil: 'networkidle' }).catch(() => {});
   const clave = page.locator('input[type=password]').first();
@@ -80,10 +80,13 @@ async function iniciarSesion(page, urlLogin, user, pass, esLogin) {
   await page.locator('select').first().selectOption({ label: 'Español' }, { timeout: 2000 }).catch(() => {});
   await page.waitForTimeout(1000);
   const usuario = page.locator('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio])').first();
-  await usuario.fill(user.trim());
-  await clave.fill(pass.trim());
-  const recordar = page.locator('input[type=checkbox]').first();
-  if (await recordar.count()) await recordar.check({ timeout: 2000 }).catch(() => {});
+  // Se escribe tecla por tecla, como una persona (algunas páginas no toman el texto pegado de una)
+  await usuario.click(); await usuario.fill(''); await usuario.pressSequentially(user.trim(), { delay: 40 });
+  await clave.click(); await clave.fill(''); await clave.pressSequentially(pass.trim(), { delay: 40 });
+  if (marcarRecordar) {   // solo en PayScan ("Recuérdame"); en VM Shopping la casilla cambia el tipo de cuenta
+    const recordar = page.locator('input[type=checkbox]').first();
+    if (await recordar.count()) await recordar.check({ timeout: 2000 }).catch(() => {});
+  }
   const boton = page.locator([
     'button[type=submit]', 'button:has-text("Entrar")', 'button:has-text("Iniciar")', 'button:has-text("Ingresar")',
     'button:has-text("Login")', 'button:has-text("Log in")', 'button:has-text("Sign in")', 'button:has-text("登录")',
@@ -242,7 +245,7 @@ async function postear(url, cuerpo, llave) {
     let ventas = await leerVentas(page);
     if (ventas === null) {
       console.log('PayScan: la sesión venció, iniciando sesión');
-      if (await iniciarSesion(page, `${PS}/#/auth/login`, PS_USER, PS_PASS, esLoginPs)) ventas = await leerVentas(page);
+      if (await iniciarSesion(page, `${PS}/#/auth/login`, PS_USER, PS_PASS, esLoginPs, true)) ventas = await leerVentas(page);
       if (ventas === null) { informe.ventasLogin = true; await debug(page, 'payscan-login', false); throw new Error('pidió iniciar sesión y no pude entrar'); }
     }
     informe.ventas = ventas; informe.ventasDia = t.dia;
