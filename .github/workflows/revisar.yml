@@ -1,0 +1,84 @@
+name: Revisar máquinas PapaPoint
+
+on:
+  schedule:
+    # Cada 7 minutos. Las horas van en UTC y cubren 05:45 a 23:30 de Santiago en invierno y en verano;
+    # el primer paso apaga la corrida si en Santiago está fuera de ese horario.
+    - cron: '*/7 8-23,0-3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: revisar-maquinas
+  cancel-in-progress: false
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: ¿Está en horario? (05:45 a 23:30 de Santiago)
+        id: hora
+        run: |
+          H=$(TZ=America/Santiago date +%H%M)
+          if (( 10#$H >= 545 && 10#$H <= 2330 )) || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "activo=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "Fuera de horario ($H en Santiago): no se revisa."
+            echo "activo=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.hora.outputs.activo == '1'
+
+      - uses: actions/setup-node@v4
+        if: steps.hora.outputs.activo == '1'
+        with:
+          node-version: 20
+
+      - name: Recuperar sesión guardada
+        if: steps.hora.outputs.activo == '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: .sesion
+          key: sesion-${{ github.run_id }}
+          restore-keys: sesion-
+
+      - name: Instalar navegador
+        if: steps.hora.outputs.activo == '1'
+        run: |
+          npm install --no-save --no-package-lock playwright@1
+          npx playwright install --with-deps chromium
+
+      - name: Revisar máquinas y avisar
+        if: steps.hora.outputs.activo == '1'
+        env:
+          VM_USER: ${{ secrets.VM_USER }}
+          VM_PASS: ${{ secrets.VM_PASS }}
+        run: node revisar.js
+
+      - name: Guardar sesión
+        if: always() && steps.hora.outputs.activo == '1' && hashFiles('.sesion/state.bin') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .sesion
+          key: sesion-${{ github.run_id }}
+
+      - name: Guardar estado en el repositorio
+        if: always() && steps.hora.outputs.activo == '1'
+        run: |
+          git config user.name "papapoint-revisor"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add estado.json 2>/dev/null || true
+          git diff --cached --quiet || (git commit -m "Estado de las máquinas" && git push)
+
+      - name: Subir pantallazos si algo falló
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
+          retention-days: 3
+          if-no-files-found: ignore
