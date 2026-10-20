@@ -87,7 +87,10 @@ async function iniciarSesion(page) {
   if (await boton.count()) await boton.click(); else await clave.press('Enter');
   await page.waitForURL(u => !/\/login/.test(u.toString()), { timeout: 20000 }).catch(() => {});
   clearInterval(espia);
-  return !(await enLogin(page));
+  // La página cambia de dirección antes de sacar el formulario: esperar a que desaparezca
+  await page.locator('input[type=password]').first().waitFor({ state: 'detached', timeout: 15000 }).catch(() => {});
+  await page.waitForTimeout(1500);
+  return !/\/login/.test(page.url());
 }
 
 // ---------- leer las máquinas ----------
