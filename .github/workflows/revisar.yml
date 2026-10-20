@@ -57,6 +57,8 @@ jobs:
         env:
           VM_USER: ${{ secrets.VM_USER }}
           VM_PASS: ${{ secrets.VM_PASS }}
+          VMADMIN_USER: ${{ secrets.VMADMIN_USER }}
+          VMADMIN_PASS: ${{ secrets.VMADMIN_PASS }}
           PAYSCAN_USER: ${{ secrets.PAYSCAN_USER }}
           PAYSCAN_PASS: ${{ secrets.PAYSCAN_PASS }}
           PP_LLAVE: ${{ secrets.PP_LLAVE }}
