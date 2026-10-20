@@ -49,6 +49,13 @@ async function debug(page, nombre) {
     await page.screenshot({ path: `debug/${nombre}.png`, fullPage: true });
     const txt = await page.innerText('body').catch(() => '');
     fs.writeFileSync(`debug/${nombre}.txt`, page.url() + '\n\n' + txt);
+    // Pistas para el registro (nunca muestra lo escrito en los campos)
+    const campos = await page.$$eval('input, button, select', els => els.map(e =>
+      `${e.tagName.toLowerCase()} type=${e.type || ''} name=${e.name || ''} placeholder=${e.placeholder || ''} texto=${(e.innerText || '').trim().slice(0, 30)}`
+    )).catch(() => []);
+    console.log(`[debug ${nombre}] url=${page.url().split('?')[0]}`);
+    console.log(`[debug ${nombre}] texto: ${txt.replace(/\s+/g, ' ').slice(0, 400)}`);
+    console.log(`[debug ${nombre}] campos:\n  ` + campos.join('\n  '));
   } catch {}
 }
 
@@ -59,9 +66,10 @@ async function enLogin(page) {
 // ---------- iniciar sesión ----------
 async function iniciarSesion(page) {
   if (!USER || !PASS) throw new Error('Faltan los secretos VM_USER y VM_PASS en GitHub');
-  await page.goto(BASE + '/login', { waitUntil: 'domcontentloaded' });
+  await page.goto(BASE + '/login', { waitUntil: 'networkidle' }).catch(() => {});
   const clave = page.locator('input[type=password]').first();
   await clave.waitFor({ timeout: 30000 });
+  await page.waitForTimeout(1000);
   const usuario = page.locator('input:not([type=password]):not([type=hidden]):not([type=checkbox]):not([type=radio])').first();
   await usuario.fill(USER);
   await clave.fill(PASS);
