@@ -173,7 +173,13 @@ async function leerAdmin(page) {
 
 // ---------- 4a) stock de papas (pantalla Carriles de la app de mantención) ----------
 // Cada máquina se abre y se lee su carril de papas: "FRIES RAW MATERIALS … Stock: 7550/11000" (gramos)
+// La app sale en el idioma guardado en el navegador (el robot la ve en chino): se fija en español y además se entienden los 3 idiomas
+async function enEspanol(page) {
+  await page.evaluate(() => { try { localStorage.setItem('locale', 'es-ES'); } catch (e) {} }).catch(() => {});
+}
+const STOCK_RE = /(?:Stock|库存)\s*[:：]\s*(\d+)\s*\/\s*(\d+)/;
 async function leerStock(page) {
+  await enEspanol(page);
   await page.goto(MANT + '/slots', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => /#M\d{3}/.test(document.body.innerText) || /\/login/.test(location.pathname), null, { timeout: 40000 }).catch(() => {});
   if (esLoginMant(page.url())) return null;
@@ -187,14 +193,14 @@ async function leerStock(page) {
     await page.waitForFunction(s => {
       const t = document.body.innerText; const i = t.indexOf(s); if (i < 0) return false;
       const resto = t.slice(i + s.length); const j = resto.search(/\n[A-Z]{3,}\d{6,}\n/);
-      return /Stock:\s*\d+\s*\/\s*\d+/.test(j < 0 ? resto : resto.slice(0, j));
+      return /(?:Stock|库存)\s*[:：]\s*\d+\s*\/\s*\d+/.test(j < 0 ? resto : resto.slice(0, j));
     }, sn, { timeout: 8000 }).catch(() => {});
     const t = await page.innerText('body');
     const i = t.indexOf(sn); if (i < 0) continue;
     let bloque = t.slice(i + sn.length); const j = bloque.search(/\n[A-Z]{3,}\d{6,}\n/); if (j >= 0) bloque = bloque.slice(0, j);
     const id = (bloque.match(/#(M\d{3})/) || [])[1] || SERIAL_MAQ[sn];
     // El carril con papas: el primer "Stock" después de FRIES/papas; si no aparece el nombre, el primer Stock
-    const papas = bloque.match(/(?:FRIES|PAPA|PATATA)[\s\S]{0,120}?Stock:\s*(\d+)\s*\/\s*(\d+)/i) || bloque.match(/Stock:\s*(\d+)\s*\/\s*(\d+)/);
+    const papas = bloque.match(/(?:FRIES|PAPA|PATATA)[\s\S]{0,120}?(?:Stock|库存)\s*[:：]\s*(\d+)\s*\/\s*(\d+)/i) || bloque.match(STOCK_RE);
     if (id && papas) stock[id] = { g: +papas[1], max: +papas[2] };
     await el.click({ timeout: 5000 }).catch(() => {});   // cerrarla para que no se mezcle con la siguiente
     await page.waitForTimeout(400);
@@ -207,12 +213,18 @@ async function leerStock(page) {
 // pero si ya se tienen los pedidos de hoy de corridas anteriores, basta con las 2 primeras páginas.
 const ESTADOS_PED = ['Pendiente de pago', 'Pagando', 'Pago fallido', 'Cancelado', 'Pagado', 'Entregando', 'Entregado',
   'Reembolsado', 'Entrega fallida', 'Completado', 'Recogida fallida', 'Esperando recogida'];
+const ESTADOS_EN = ['Pending Payment', 'Paying', 'Payment Failed', 'Cancelled', 'Paid', 'Delivering', 'Delivered',
+  'Refunded', 'Delivery Failed', 'Completed', 'Pickup Failed', 'Awaiting Receipt'];
+const ESTADOS_ZH = ['等待支付', '支付中', '支付失败', '已取消', '已支付', '出货中', '已出货', '已退款', '出货失败', '已完成', '取货失败', '待收货'];
+const ESTADO_ES = {};
+ESTADOS_PED.forEach((e, i) => { ESTADO_ES[e] = e; ESTADO_ES[ESTADOS_EN[i]] = e; ESTADO_ES[ESTADOS_ZH[i]] = e; });
 async function leerPedidos(page, hoy, yaTengo) {
+  await enEspanol(page);
   await page.goto(MANT + '/orders', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(document.body.innerText) || /\/login/.test(location.pathname), null, { timeout: 40000 }).catch(() => {});
   if (esLoginMant(page.url())) return null;
   await page.waitForTimeout(800);
-  const re = new RegExp('(' + ESTADOS_PED.join('|') + ')\\n(\\d{8,})([A-Z]{3,}\\d{6,})\\n(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2})\\nCLP\\$\\s*([\\d.,]+)', 'g');
+  const re = new RegExp('(?<=^|\\n)(' + Object.keys(ESTADO_ES).sort((a, b) => b.length - a.length).join('|') + ')\\n(\\d{8,})([A-Z]{3,}\\d{6,})\\n(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2})\\nCLP\\$\\s*([\\d.,]+)', 'g');
   const out = {}, tope = yaTengo ? 2 : 15;
   for (let pag = 1; pag <= tope; pag++) {
     const t = await page.innerText('body');
@@ -222,7 +234,7 @@ async function leerPedidos(page, hoy, yaTengo) {
       const f = r[4];
       if (f.slice(0, 10) < hoy) { viejo = true; continue; }
       if (f.slice(0, 10) > hoy) continue;
-      out[r[2]] = { m: SERIAL_MAQ[r[3]] || '?', st: r[1], f, clp: num(r[5]) };
+      out[r[2]] = { m: SERIAL_MAQ[r[3]] || '?', st: ESTADO_ES[r[1]] || r[1], f, clp: num(r[5]) };
     }
     re.lastIndex = 0;
     if (viejo || !n) break;
@@ -334,7 +346,7 @@ async function postear(url, cuerpo, llave) {
   // 4) Stock y pedidos de hoy (misma sesión de la app de mantención). Nada de esto se escribe en el registro público.
   const extra = { dia: t.dia };
   if (mant) {
-    try { const st = await leerStock(page); if (st && Object.keys(st).length) extra.stock = st; else fallas.push('stock: no lo encontré'); }
+    try { const st = await leerStock(page); if (st && Object.keys(st).length) extra.stock = st; else { fallas.push('stock: no lo encontré'); await debug(page, 'stock'); } }
     catch (e) { fallas.push('stock: ' + e.message); }
     try {
       let previos = leerSesion(PEDIDOS_BIN);
