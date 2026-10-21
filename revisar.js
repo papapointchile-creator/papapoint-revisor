@@ -2,7 +2,7 @@
 // Cada 7 minutos (de 05:45 a 23:30, hora de Santiago) en GitHub Actions:
 //  1) App de mantención de VM Shopping: en línea y alertas de cada máquina.
 //  2) App de administración de VM Shopping: en línea y hora de la última conexión.
-//  3) PayScan: ventas de hoy por máquina (Resumen por dispositivos).
+//  3) PayScan: lista de transacciones de los últimos 15 días (hora de cada venta), por máquina.
 // Le manda todo a papapoint.cl: pp-alertas.php (alertas y conexión por Telegram, como siempre)
 // y pp-revisor.php (ventas, 2 horas sin vender y la página "Máquinas en vivo" de la intranet).
 // El registro de GitHub es público: aquí nunca se escriben ventas, montos ni datos de las cuentas.
@@ -168,44 +168,51 @@ async function leerAdmin(page) {
 // ---------- 3) PayScan ----------
 const esLoginPs = u => /auth\/login/.test(u);
 const num = s => parseInt(String(s || '').replace(/[^\d]/g, ''), 10) || 0;
-async function leerVentas(page) {
+// Lee la LISTA de transacciones (no el resumen) directo de la API que usa la página de PayScan,
+// con el mismo inicio de sesión: así sale la hora de cada venta y el conteo cuadra con PayScan.
+// Trae los últimos DIAS_TX días (hora de Santiago) para armar la curva hora a hora y el historial.
+const DIAS_TX = 15;
+const KIT_MAQ = { '230800': 'M001', '230799': 'M002', '230798': 'M003' };    // Kit Id en PayScan → máquina
+const MAQ_POS = Object.fromEntries(Object.entries(POS_MAQ).map(([p, m]) => [m, p]));
+function diaMas(dia, n) { const d = new Date(dia + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); }
+function desfaseSantiago() {   // horas que Santiago está detrás de UTC (3 en verano, 4 en invierno)
+  const p = Object.fromEntries(new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/Santiago', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false })
+    .formatToParts(new Date()).map(x => [x.type, x.value]));
+  const local = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute);
+  return Math.round((Date.now() - local) / 3600000);
+}
+async function leerVentas(page, hoy) {
   await page.goto(`${PS}/#/transactions?commerce_id=${PS_COMERCIO}`, { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(4000);
   if (esLoginPs(page.url())) return null;
-  // Pestaña "Resumen por dispositivos"; el filtro de fecha parte en "Hoy"
-  const pestana = page.getByText('Resumen por dispositivos', { exact: false }).first();
-  await pestana.click({ timeout: 20000 });
-  await page.waitForTimeout(2500);
-  const aplicar = page.getByText('Aplicar Filtros', { exact: false }).first();
-  if (await aplicar.count()) { await aplicar.click({ timeout: 5000 }).catch(() => {}); await page.waitForTimeout(3500); }
-  const tablas = await page.$$eval('table, mat-table, [role=table], [role=grid]', ts => ts.map(t => ({
-    h: [...t.querySelectorAll('th, mat-header-cell, [role=columnheader]')].map(x => x.innerText.trim()),
-    r: [...t.querySelectorAll('tbody tr, mat-row, [role=row]')]
-      .map(tr => [...tr.querySelectorAll('td, mat-cell, [role=cell], [role=gridcell]')].map(td => td.innerText.trim()))
-      .filter(c => c.length),
-  })));
-  const t = tablas.find(x => x.h.some(h => /serial/i.test(h)));
-  if (!t) {
-    const vacio = /no hay|sin (datos|resultados|registros)|no se encontraron|0 resultados/i.test(await page.innerText('body'));
-    if (vacio) return {};
-    console.log('[debug payscan] no encontré la tabla; encabezados vistos: ' + JSON.stringify(tablas.map(x => x.h)));
-    throw new Error('no encontré la tabla de Resumen por dispositivos');
+  const off = desfaseSantiago(), hh = n => String(n).padStart(2, '0');
+  const desde = diaMas(hoy, -(DIAS_TX - 1));
+  const q = `date_start=${desde}T${hh(off)}:00:00&date_end=${diaMas(hoy, 1)}T${hh(off - 1)}:59:59&offset=${off}`;
+  const r = await page.evaluate(async ({ comercio, q }) => {
+    let tk = sessionStorage.getItem('token');
+    if (!tk) return { status: 401 };
+    try { const j = JSON.parse(tk); if (typeof j === 'string') tk = j; } catch {}
+    const res = await fetch(`/api/commerces/${comercio}/transactions?${q}`, { headers: { Authorization: 'Bearer ' + tk } });
+    if (!res.ok) return { status: res.status };
+    const d = await res.json();
+    if (!Array.isArray(d)) return { status: 200, raro: true };
+    return { status: 200, tx: d.map(x => [x.date_local, x.kit_id, x.transaction_result, (x.transaction_amount || {}).amount]) };
+  }, { comercio: PS_COMERCIO, q });
+  if (r.status === 401 || r.status === 403) return null;
+  if (r.status !== 200) throw new Error('la lista de transacciones respondió ' + r.status);
+  if (r.raro) throw new Error('la lista de transacciones cambió de formato');
+  // Solo APROBADAS. tx: día → máquina → [[HH:MM, monto], ...]
+  const tx = {}, ventas = {};
+  for (const [fecha, kit, res, monto] of r.tx) {
+    const m = KIT_MAQ[String(kit)];
+    if (!m || res !== 'APPROVED' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(fecha || '')) continue;
+    const dia = fecha.slice(0, 10), hm = fecha.slice(11, 16), clp = num(monto);
+    if (dia < desde || dia > hoy) continue;
+    ((tx[dia] = tx[dia] || {})[m] = tx[dia][m] || []).push([hm, clp]);
+    if (dia === hoy) { const v = ventas[MAQ_POS[m]] || (ventas[MAQ_POS[m]] = { n: 0, clp: 0 }); v.n++; v.clp += clp; }
   }
-  const col = re => t.h.findIndex(h => re.test(h));
-  const iS = col(/serial/i), iE = col(/estado/i), iN = col(/n[°º.]?\s*(de\s*)?tx|cantidad|transacc/i), iT = col(/venta total|total|monto/i);
-  if (iS < 0 || iN < 0 || iT < 0) {
-    console.log('[debug payscan] encabezados: ' + JSON.stringify(t.h));
-    throw new Error('la tabla de PayScan cambió de columnas');
-  }
-  const ventas = {};
-  for (const c of t.r) {
-    const serial = (c[iS] || '').replace(/\D/g, '');
-    if (!serial) continue;
-    if (iE >= 0 && !/aprob/i.test(c[iE] || '')) continue;   // solo transacciones APROBADAS
-    const v = ventas[serial] || (ventas[serial] = { n: 0, clp: 0 });
-    v.n += num(c[iN]); v.clp += num(c[iT]);
-  }
-  return ventas;
+  for (const d of Object.values(tx)) for (const l of Object.values(d)) l.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
+  return { ventas, tx, desde };
 }
 
 async function postear(url, cuerpo, llave) {
@@ -255,13 +262,14 @@ async function postear(url, cuerpo, llave) {
 
   // 3) PayScan (sin pantallazos: mostrarían ventas)
   try {
-    let ventas = await leerVentas(page);
-    if (ventas === null) {
+    let lv = await leerVentas(page, t.dia);
+    if (lv === null) {
       console.log('PayScan: la sesión venció, iniciando sesión');
-      if (await iniciarSesion(page, `${PS}/#/auth/login`, PS_USER, PS_PASS, esLoginPs, true)) ventas = await leerVentas(page);
-      if (ventas === null) { informe.ventasLogin = true; await debug(page, 'payscan-login', false); throw new Error('pidió iniciar sesión y no pude entrar'); }
+      if (await iniciarSesion(page, `${PS}/#/auth/login`, PS_USER, PS_PASS, esLoginPs, true)) lv = await leerVentas(page, t.dia);
+      if (lv === null) { informe.ventasLogin = true; await debug(page, 'payscan-login', false); throw new Error('pidió iniciar sesión y no pude entrar'); }
     }
-    informe.ventas = ventas; informe.ventasDia = t.dia;
+    informe.ventas = lv.ventas; informe.ventasDia = t.dia;
+    informe.tx = lv.tx; informe.txDesde = lv.desde;
   } catch (e) { informe.ventasError = e.message.slice(0, 100); fallas.push('PayScan: ' + e.message); }
 
   guardarSesion(await ctx.storageState());
@@ -296,13 +304,17 @@ async function postear(url, cuerpo, llave) {
     let h = null;
     h = leerSesion('.sesion/ventas.bin');
     if (!h || typeof h.hist !== 'object') h = { hist: {} };
-    const hoy = {};
-    for (const [pos, m] of Object.entries(POS_MAQ)) {
-      const v = informe.ventas[pos] || { n: 0, clp: 0 };
-      hoy[m] = { n: v.n | 0, clp: v.clp | 0 };
+    // Días completos sacados de la lista de transacciones (corrige también días anteriores)
+    let cambio = !fs.existsSync(VENTAS_ENC);
+    for (let d = informe.txDesde; d && d <= t.dia; d = diaMas(d, 1)) {
+      const dia = {};
+      for (const m of Object.values(POS_MAQ)) {
+        const l = ((informe.tx || {})[d] || {})[m] || [];
+        dia[m] = { n: l.length, clp: l.reduce((s, x) => s + (x[1] | 0), 0) };
+      }
+      if (JSON.stringify(h.hist[d]) !== JSON.stringify(dia)) { h.hist[d] = dia; cambio = true; }
     }
-    if (JSON.stringify(h.hist[t.dia]) !== JSON.stringify(hoy) || !fs.existsSync(VENTAS_ENC)) {
-      h.hist[t.dia] = hoy;
+    if (cambio) {
       const lim = new Date(Date.now() - 62 * 864e5).toISOString().slice(0, 10);
       for (const d of Object.keys(h.hist)) if (d < lim) delete h.hist[d];
       h.u = `${t.dia} ${t.hora}`;
