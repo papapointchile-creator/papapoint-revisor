@@ -1,8 +1,9 @@
 // PapaPoint · Revisor de máquinas y ventas
-// Cada 7 minutos (de 05:45 a 23:30, hora de Santiago) en GitHub Actions:
+// Cada 5 minutos (de 05:45 a 23:30, hora de Santiago; lo lanza el reloj del cPanel) en GitHub Actions:
 //  1) App de mantención de VM Shopping: en línea y alertas de cada máquina.
 //  2) App de administración de VM Shopping: en línea y hora de la última conexión.
 //  3) PayScan: lista de transacciones de los últimos 15 días (hora de cada venta), por máquina.
+//  4) App de mantención: stock de papas de cada máquina (Carriles) y pedidos de hoy con su estado (Pedidos).
 // Le manda todo a papapoint.cl: pp-alertas.php (alertas y conexión por Telegram, como siempre)
 // y pp-revisor.php (ventas, 2 horas sin vender y la página "Máquinas en vivo" de la intranet).
 // El registro de GitHub es público: aquí nunca se escriben ventas, montos ni datos de las cuentas.
@@ -17,6 +18,8 @@ const PS = 'https://admin.payscan.cl';
 const PS_COMERCIO = '3194';
 const AVISOS = 'https://www.papapoint.cl/pp-alertas.php';
 const REVISOR = 'https://www.papapoint.cl/pp-revisor.php';
+const EXTRA = 'https://www.papapoint.cl/pp-extra.php';   // stock y pedidos (21-10-2026)
+const PEDIDOS_BIN = '.sesion/pedidos.bin';                // pedidos de hoy ya vistos (cifrados, en el cache)
 const SESION = '.sesion/state.bin';   // sesiones guardadas (cifradas) para no iniciar sesión en cada corrida
 const ESTADO = 'estado.json';         // último estado de conexión y alertas, queda en el repositorio
 const VENTAS_ENC = 'ventas.enc';      // ventas por día y máquina, CIFRADAS (el repositorio es público)
@@ -142,9 +145,12 @@ async function leerMant(page) {
       : (/En l[ií]nea|Online|在线/i.test(bloque) ? true : null);
     const al = bloque.match(/(?:Alerta|Alert|Alarm|告警|报警|警报)\s*:?\s*(\d{1,3})\b/i);
     maq[id] = { online, alerta: al ? al[1] : null };
+    const sn = (bloque.match(/\b([A-Z]{3,}\d{6,})\b/) || [])[1];
+    if (sn) SERIAL_MAQ[sn] = id;
   }
   return maq;
 }
+const SERIAL_MAQ = { BDSTJ2612001: 'M001', BDSTJ2612002: 'M002', BDSTJ2612003: 'M003' };   // se completa con lo que se ve en la app
 
 // ---------- 2) app de administración ----------
 const esLoginAdmin = u => /mall\.vm-shopping\.com\/login/.test(u);
@@ -163,6 +169,71 @@ async function leerAdmin(page) {
   let r;
   while ((r = re.exec(txt))) maq[r[1]] = { online: /^(online|在线|en l)/i.test(r[2]), visto: r[3] };
   return maq;
+}
+
+// ---------- 4a) stock de papas (pantalla Carriles de la app de mantención) ----------
+// Cada máquina se abre y se lee su carril de papas: "FRIES RAW MATERIALS … Stock: 7550/11000" (gramos)
+async function leerStock(page) {
+  await page.goto(MANT + '/slots', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => /#M\d{3}/.test(document.body.innerText) || /\/login/.test(location.pathname), null, { timeout: 40000 }).catch(() => {});
+  if (esLoginMant(page.url())) return null;
+  await page.waitForTimeout(1200);
+  const stock = {};
+  const series = await page.getByText(/^[A-Z]{3,}\d{6,}$/).all();
+  for (const el of series) {
+    const sn = ((await el.innerText().catch(() => '')) || '').trim();
+    if (!sn) continue;
+    await el.click({ timeout: 5000 }).catch(() => {});
+    await page.waitForFunction(s => {
+      const t = document.body.innerText; const i = t.indexOf(s); if (i < 0) return false;
+      const resto = t.slice(i + s.length); const j = resto.search(/\n[A-Z]{3,}\d{6,}\n/);
+      return /Stock:\s*\d+\s*\/\s*\d+/.test(j < 0 ? resto : resto.slice(0, j));
+    }, sn, { timeout: 8000 }).catch(() => {});
+    const t = await page.innerText('body');
+    const i = t.indexOf(sn); if (i < 0) continue;
+    let bloque = t.slice(i + sn.length); const j = bloque.search(/\n[A-Z]{3,}\d{6,}\n/); if (j >= 0) bloque = bloque.slice(0, j);
+    const id = (bloque.match(/#(M\d{3})/) || [])[1] || SERIAL_MAQ[sn];
+    // El carril con papas: el primer "Stock" después de FRIES/papas; si no aparece el nombre, el primer Stock
+    const papas = bloque.match(/(?:FRIES|PAPA|PATATA)[\s\S]{0,120}?Stock:\s*(\d+)\s*\/\s*(\d+)/i) || bloque.match(/Stock:\s*(\d+)\s*\/\s*(\d+)/);
+    if (id && papas) stock[id] = { g: +papas[1], max: +papas[2] };
+    await el.click({ timeout: 5000 }).catch(() => {});   // cerrarla para que no se mezcle con la siguiente
+    await page.waitForTimeout(400);
+  }
+  return stock;
+}
+
+// ---------- 4b) pedidos de hoy (pantalla Pedidos de la app de mantención) ----------
+// 20 pedidos por página, del más nuevo al más antiguo. Se leen páginas hasta llegar a ayer (máximo 15),
+// pero si ya se tienen los pedidos de hoy de corridas anteriores, basta con las 2 primeras páginas.
+const ESTADOS_PED = ['Pendiente de pago', 'Pagando', 'Pago fallido', 'Cancelado', 'Pagado', 'Entregando', 'Entregado',
+  'Reembolsado', 'Entrega fallida', 'Completado', 'Recogida fallida', 'Esperando recogida'];
+async function leerPedidos(page, hoy, yaTengo) {
+  await page.goto(MANT + '/orders', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(document.body.innerText) || /\/login/.test(location.pathname), null, { timeout: 40000 }).catch(() => {});
+  if (esLoginMant(page.url())) return null;
+  await page.waitForTimeout(800);
+  const re = new RegExp('(' + ESTADOS_PED.join('|') + ')\\n(\\d{8,})([A-Z]{3,}\\d{6,})\\n(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2})\\nCLP\\$\\s*([\\d.,]+)', 'g');
+  const out = {}, tope = yaTengo ? 2 : 15;
+  for (let pag = 1; pag <= tope; pag++) {
+    const t = await page.innerText('body');
+    let r, viejo = false, n = 0;
+    while ((r = re.exec(t))) {
+      n++;
+      const f = r[4];
+      if (f.slice(0, 10) < hoy) { viejo = true; continue; }
+      if (f.slice(0, 10) > hoy) continue;
+      out[r[2]] = { m: SERIAL_MAQ[r[3]] || '?', st: r[1], f, clp: num(r[5]) };
+    }
+    re.lastIndex = 0;
+    if (viejo || !n) break;
+    const sig = page.locator('button:has-text("Siguiente"), button:has-text("Next"), button:has-text("下一页")').first();
+    if (!(await sig.count()) || await sig.isDisabled().catch(() => true)) break;
+    const antes = t.slice(0, 2000);
+    await sig.click().catch(() => {});
+    await page.waitForFunction(a => document.body.innerText.slice(0, 2000) !== a, antes, { timeout: 10000 }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+  return out;
 }
 
 // ---------- 3) PayScan ----------
@@ -260,6 +331,24 @@ async function postear(url, cuerpo, llave) {
   } catch (e) { informe.adminError = e.message.slice(0, 100); fallas.push('administración: ' + e.message); }
   else informe.adminError = 'falta guardar su usuario y clave en GitHub';
 
+  // 4) Stock y pedidos de hoy (misma sesión de la app de mantención). Nada de esto se escribe en el registro público.
+  const extra = { dia: t.dia };
+  if (mant) {
+    try { const st = await leerStock(page); if (st && Object.keys(st).length) extra.stock = st; else fallas.push('stock: no lo encontré'); }
+    catch (e) { fallas.push('stock: ' + e.message); }
+    try {
+      let previos = leerSesion(PEDIDOS_BIN);
+      if (!previos || previos.dia !== t.dia) previos = { dia: t.dia, p: {} };
+      const nuevos = await leerPedidos(page, t.dia, Object.keys(previos.p).length > 0);
+      if (nuevos) {
+        Object.assign(previos.p, nuevos);   // el estado más reciente de cada pedido manda
+        guardarSesion(previos, PEDIDOS_BIN);
+        extra.pedidosDia = t.dia;
+        extra.pedidos = Object.entries(previos.p).map(([id, x]) => ({ id, ...x }));
+      }
+    } catch (e) { fallas.push('pedidos: ' + e.message); }
+  }
+
   // 3) PayScan (sin pantallazos: mostrarían ventas)
   try {
     let lv = await leerVentas(page, t.dia);
@@ -285,9 +374,14 @@ async function postear(url, cuerpo, llave) {
     const r = await postear(REVISOR, informe, LLAVE_PP);
     console.log(`pp-revisor → ${r.status}: ${r.texto}`);
   } else console.log('Falta el secreto PP_LLAVE: no se mandaron ventas ni estado a la intranet');
+  // Stock y pedidos a la intranet (receptor aparte, con la misma llave)
+  if (LLAVE_PP && (extra.stock || extra.pedidos)) {
+    const r = await postear(EXTRA, extra, LLAVE_PP).catch(e => ({ status: 0, texto: e.message }));
+    console.log(`pp-extra → ${r.status}`);
+  }
 
   // Registro público: solo qué se pudo leer, sin cifras de ventas
-  console.log(`${t.dia} ${t.hora} · mantención: ${mant ? JSON.stringify(mant) : 'sin dato'} · administración: ${informe.admin ? Object.keys(informe.admin).length + ' máquinas' : 'sin dato'} · PayScan: ${informe.ventas ? 'leído' : 'sin dato'}`);
+  console.log(`${t.dia} ${t.hora} · mantención: ${mant ? JSON.stringify(mant) : 'sin dato'} · administración: ${informe.admin ? Object.keys(informe.admin).length + ' máquinas' : 'sin dato'} · PayScan: ${informe.ventas ? 'leído' : 'sin dato'} · stock: ${extra.stock ? Object.keys(extra.stock).length + ' máquinas' : 'sin dato'} · pedidos: ${extra.pedidos ? 'leídos' : 'sin dato'}`);
   if (fallas.length) console.log('Avisos: ' + fallas.join(' | '));
 
   // Estado en el repositorio (cambia al menos una vez al día, así GitHub no pausa la tarea)
