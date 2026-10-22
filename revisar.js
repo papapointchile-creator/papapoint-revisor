@@ -285,7 +285,7 @@ function actualizarVivo(pedidos) {   // pedidos: id → {m, st, f}
 async function avisarVivo(lista, fin = false) {
   if (!LLAVE_PP) return;
   const firma = JSON.stringify(lista.map(x => [x.id, x.st]));
-  if (!fin && firma === vivo.ultFirma && Date.now() - vivo.ultEnvio < 60000) return;   // sin cambios: un latido por minuto
+  // Se manda en cada vuelta (cada 20 s) para que la página muestre "mirado hace X s" real; la firma queda por si se quiere espaciar
   const r = await postear(ENVIVO, { u: Math.round(Date.now() / 1000), cada: VIGILAR_CADA_MS / 1000, fin, ped: lista }, LLAVE_PP).catch(e => ({ status: 0 }));
   if (r.status === 200) { vivo.ultFirma = firma; vivo.ultEnvio = Date.now(); vivo.envios++; }
 }
