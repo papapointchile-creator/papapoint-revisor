@@ -65,15 +65,12 @@ jobs:
           path: ~/.cache/ms-playwright
           key: navegador-${{ runner.os }}-24.04-${{ steps.pw.outputs.version }}
 
+      # (22-10-2026) Sin "--with-deps": la máquina de GitHub (Ubuntu 24.04) ya trae Chrome y todas sus librerías;
+      # lo lento era apt bajando fuentes y paquetes que no se usan (llegaba a 8 min).
       - name: Instalar navegador
-        if: steps.hora.outputs.activo == '1'
-        timeout-minutes: 3   # si se pega, se corta aquí y no se come toda la corrida
-        run: |
-          if [ "${{ steps.navcache.outputs.cache-hit }}" = "true" ]; then
-            npx playwright install-deps chromium
-          else
-            npx playwright install --with-deps chromium
-          fi
+        if: steps.hora.outputs.activo == '1' && steps.navcache.outputs.cache-hit != 'true'
+        timeout-minutes: 4
+        run: npx playwright install chromium
 
       - name: Guardar navegador
         if: steps.hora.outputs.activo == '1' && steps.navcache.outputs.cache-hit != 'true'
