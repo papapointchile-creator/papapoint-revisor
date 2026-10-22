@@ -4,6 +4,8 @@
 //  2) App de administración de VM Shopping: en línea y hora de la última conexión.
 //  3) PayScan: lista de transacciones de los últimos 15 días (hora de cada venta), por máquina.
 //  4) App de mantención: stock de papas de cada máquina (Carriles) y pedidos de hoy con su estado (Pedidos).
+//  5) Lo que queda de la corrida (hasta ~4,5 min): mira Pedidos cada 20 s y avisa a pp-envivo.php qué pedido
+//     se está pagando, friendo o esperando que lo saquen ("Máquinas en vivo" lo muestra casi en vivo).
 // Le manda todo a papapoint.cl: pp-alertas.php (alertas y conexión por Telegram, como siempre)
 // y pp-revisor.php (ventas, 2 horas sin vender y la página "Máquinas en vivo" de la intranet).
 // El registro de GitHub es público: aquí nunca se escriben ventas, montos ni datos de las cuentas.
@@ -19,6 +21,12 @@ const PS_COMERCIO = '3194';
 const AVISOS = 'https://www.papapoint.cl/pp-alertas.php';
 const REVISOR = 'https://www.papapoint.cl/pp-revisor.php';
 const EXTRA = 'https://www.papapoint.cl/pp-extra.php';   // stock y pedidos (21-10-2026)
+const ENVIVO = 'https://www.papapoint.cl/pp-envivo.php'; // pedidos en curso, casi en vivo (22-10-2026)
+const T0 = Date.now();
+// (22-10-2026) Después de leer todo, el revisor se queda mirando la pantalla Pedidos cada 20 s hasta este tope
+// (contado desde que parte el script) y le avisa a la intranet qué pedido se está pagando, friendo o esperando que lo saquen.
+const VIGILAR_HASTA_MS = 4.5 * 60 * 1000;
+const VIGILAR_CADA_MS = 20 * 1000;
 const PEDIDOS_BIN = '.sesion/pedidos.bin';                // pedidos de hoy ya vistos (cifrados, en el cache)
 const SESION = '.sesion/state.bin';   // sesiones guardadas (cifradas) para no iniciar sesión en cada corrida
 const ESTADO = 'estado.json';         // último estado de conexión y alertas, queda en el repositorio
@@ -218,13 +226,14 @@ const ESTADOS_EN = ['Pending Payment', 'Paying', 'Payment Failed', 'Cancelled', 
 const ESTADOS_ZH = ['等待支付', '支付中', '支付失败', '已取消', '已支付', '出货中', '已出货', '已退款', '出货失败', '已完成', '取货失败', '待收货'];
 const ESTADO_ES = {};
 ESTADOS_PED.forEach((e, i) => { ESTADO_ES[e] = e; ESTADO_ES[ESTADOS_EN[i]] = e; ESTADO_ES[ESTADOS_ZH[i]] = e; });
+const reOrden = () => new RegExp('(?<=^|\\n)(' + Object.keys(ESTADO_ES).sort((a, b) => b.length - a.length).join('|') + ')\\n(\\d{8,})([A-Z]{3,}\\d{6,})\\n(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2})\\nCLP\\$\\s*([\\d.,]+)', 'g');
 async function leerPedidos(page, hoy, yaTengo) {
   await enEspanol(page);
   await page.goto(MANT + '/orders', { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(document.body.innerText) || /\/login/.test(location.pathname), null, { timeout: 40000 }).catch(() => {});
   if (esLoginMant(page.url())) return null;
   await page.waitForTimeout(800);
-  const re = new RegExp('(?<=^|\\n)(' + Object.keys(ESTADO_ES).sort((a, b) => b.length - a.length).join('|') + ')\\n(\\d{8,})([A-Z]{3,}\\d{6,})\\n(\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2})\\nCLP\\$\\s*([\\d.,]+)', 'g');
+  const re = reOrden();
   const out = {}, tope = yaTengo ? 2 : 15;
   for (let pag = 1; pag <= tope; pag++) {
     const t = await page.innerText('body');
@@ -246,6 +255,55 @@ async function leerPedidos(page, hoy, yaTengo) {
     await page.waitForTimeout(500);
   }
   return out;
+}
+
+// ---------- 5) pedidos en curso, casi en vivo (22-10-2026) ----------
+// Un pedido pasa por: Pendiente de pago → Pagando → Pagado → Entregando (friendo) → Esperando recogida → Completado.
+// Se miran solo los pedidos de los últimos 30 minutos que siguen en uno de esos estados.
+const EN_CURSO = ['Pendiente de pago', 'Pagando', 'Pagado', 'Entregando', 'Esperando recogida'];
+const aMin = s => Date.UTC(+s.slice(0, 4), +s.slice(5, 7) - 1, +s.slice(8, 10), +s.slice(11, 13), +s.slice(14, 16)) / 60000;
+async function leerPrimeraPagina(page) {   // solo la primera página de Pedidos (los 20 más nuevos)
+  await page.goto(MANT + '/orders', { waitUntil: 'domcontentloaded' });
+  await page.waitForFunction(() => /\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(document.body.innerText) || /\/login/.test(location.pathname), null, { timeout: 20000 }).catch(() => {});
+  if (esLoginMant(page.url())) return null;
+  await page.waitForTimeout(500);
+  const t = await page.innerText('body'), re = reOrden(), out = {};
+  let r;
+  while ((r = re.exec(t))) out[r[2]] = { m: SERIAL_MAQ[r[3]] || '?', st: ESTADO_ES[r[1]] || r[1], f: r[4] };
+  return out;
+}
+const vivo = { map: {}, ultEnvio: 0, ultFirma: '', lecturas: 0, envios: 0 };
+function actualizarVivo(pedidos) {   // pedidos: id → {m, st, f}
+  const a = ahoraSantiago(), ahora = aMin(`${a.dia} ${a.hora}`);
+  for (const [id, x] of Object.entries(pedidos || {})) {
+    const viejo = vivo.map[id];
+    if (!viejo || viejo.st !== x.st) vivo.map[id] = { m: x.m, st: x.st, f: x.f, d: Date.now() };   // d = cuándo se vio por primera vez en ese estado
+  }
+  for (const [id, x] of Object.entries(vivo.map)) if (!EN_CURSO.includes(x.st) || ahora - aMin(x.f) > 30) delete vivo.map[id];
+  return Object.entries(vivo.map).map(([id, x]) => ({ id: id.slice(-6), m: x.m, st: x.st, f: x.f.slice(11), d: Math.round(x.d / 1000) }));
+}
+async function avisarVivo(lista, fin = false) {
+  if (!LLAVE_PP) return;
+  const firma = JSON.stringify(lista.map(x => [x.id, x.st]));
+  if (!fin && firma === vivo.ultFirma && Date.now() - vivo.ultEnvio < 60000) return;   // sin cambios: un latido por minuto
+  const r = await postear(ENVIVO, { u: Math.round(Date.now() / 1000), cada: VIGILAR_CADA_MS / 1000, fin, ped: lista }, LLAVE_PP).catch(e => ({ status: 0 }));
+  if (r.status === 200) { vivo.ultFirma = firma; vivo.ultEnvio = Date.now(); vivo.envios++; }
+}
+async function vigilarPedidos(page) {
+  let errores = 0;
+  while (Date.now() - T0 + VIGILAR_CADA_MS < VIGILAR_HASTA_MS) {
+    const espera = VIGILAR_CADA_MS - ((Date.now() - T0) % VIGILAR_CADA_MS);
+    await page.waitForTimeout(espera);
+    try {
+      const l = await leerPrimeraPagina(page);
+      if (l === null) { console.log('Vigilancia de pedidos: la sesión venció, se corta'); break; }
+      vivo.lecturas++;
+      await avisarVivo(actualizarVivo(l));
+      errores = 0;
+    } catch (e) { if (++errores >= 3) { console.log('Vigilancia de pedidos: 3 errores seguidos, se corta'); break; } }
+  }
+  await avisarVivo(actualizarVivo({}), true).catch(() => {});
+  console.log(`Vigilancia de pedidos: ${vivo.lecturas} lecturas, ${vivo.envios} envíos a la intranet`);
 }
 
 // ---------- 3) PayScan ----------
@@ -352,6 +410,7 @@ async function postear(url, cuerpo, llave) {
       let previos = leerSesion(PEDIDOS_BIN);
       if (!previos || previos.dia !== t.dia) previos = { dia: t.dia, p: {} };
       const nuevos = await leerPedidos(page, t.dia, Object.keys(previos.p).length > 0);
+      if (nuevos) await avisarVivo(actualizarVivo(nuevos)).catch(() => {});   // primera foto de los pedidos en curso
       if (nuevos) {
         Object.assign(previos.p, nuevos);   // el estado más reciente de cada pedido manda
         guardarSesion(previos, PEDIDOS_BIN);
@@ -374,7 +433,6 @@ async function postear(url, cuerpo, llave) {
   } catch (e) { informe.ventasError = e.message.slice(0, 100); fallas.push('PayScan: ' + e.message); }
 
   guardarSesion(await ctx.storageState());
-  await browser.close();
 
   // Alertas y conexión por Telegram (como siempre)
   if (mant || mantLogin) {
@@ -395,6 +453,11 @@ async function postear(url, cuerpo, llave) {
   // Registro público: solo qué se pudo leer, sin cifras de ventas
   console.log(`${t.dia} ${t.hora} · mantención: ${mant ? JSON.stringify(mant) : 'sin dato'} · administración: ${informe.admin ? Object.keys(informe.admin).length + ' máquinas' : 'sin dato'} · PayScan: ${informe.ventas ? 'leído' : 'sin dato'} · stock: ${extra.stock ? Object.keys(extra.stock).length + ' máquinas' : 'sin dato'} · pedidos: ${extra.pedidos ? 'leídos' : 'sin dato'}`);
   if (fallas.length) console.log('Avisos: ' + fallas.join(' | '));
+
+  // 5) Lo que queda de la corrida: mirar los pedidos cada 20 s (solo si la app de mantención respondió)
+  if (mant) { try { await vigilarPedidos(page); } catch (e) { console.log('Vigilancia de pedidos: ' + e.message.slice(0, 80)); } }
+  try { guardarSesion(await ctx.storageState()); } catch {}
+  await browser.close();
 
   // Estado en el repositorio (cambia al menos una vez al día, así GitHub no pausa la tarea)
   if (mant) {
