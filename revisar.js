@@ -4,6 +4,8 @@
 //  2) App de administración de VM Shopping: en línea y hora de la última conexión.
 //  3) PayScan: lista de transacciones de los últimos 15 días (hora de cada venta), por máquina.
 //  4) App de mantención: stock de papas de cada máquina (Carriles) y pedidos de hoy con su estado (Pedidos).
+//  6) App de administración (sesión aparte): hora de inicio y de término de cada pedido → pp-tiempos.php
+//     (tiempo por pedido en "Máquinas en vivo" y aviso por Telegram si un pedido tarda más de 10 minutos).
 //  5) Lo que queda de la corrida (hasta ~3,5 min): mira Pedidos cada 20 s y avisa a pp-envivo.php qué pedido
 //     se está pagando, friendo o esperando que lo saquen ("Máquinas en vivo" lo muestra casi en vivo).
 // Le manda todo a papapoint.cl: pp-alertas.php (alertas y conexión por Telegram, como siempre)
@@ -22,6 +24,10 @@ const AVISOS = 'https://www.papapoint.cl/pp-alertas.php';
 const REVISOR = 'https://www.papapoint.cl/pp-revisor.php';
 const EXTRA = 'https://www.papapoint.cl/pp-extra.php';   // stock y pedidos (21-10-2026)
 const ENVIVO = 'https://www.papapoint.cl/pp-envivo.php'; // pedidos en curso, casi en vivo (22-10-2026)
+const TIEMPOS = 'https://www.papapoint.cl/pp-tiempos.php'; // tiempo de cada pedido, app de administración (22-10-2026)
+const SESION_ADM = '.sesion/admin.bin';      // sesión de la app de administración, aparte de la de mantención
+const ADM_FALLO = '.sesion/admin-fallo.bin'; // logins fallidos del día (con 2 se deja de intentar hasta mañana)
+const HIST_DESDE = '2026-10-11';             // primer día de venta al público (para cargar el historial una vez)
 const T0 = Date.now();
 // (22-10-2026) Después de leer todo, el revisor se queda mirando la pantalla Pedidos cada 20 s hasta este tope
 // (contado desde que parte el script) y le avisa a la intranet qué pedido se está pagando, friendo o esperando que lo saquen.
@@ -35,7 +41,10 @@ const POS_MAQ = { '846000190': 'M001', '846000189': 'M002', '846000188': 'M003' 
 // Llave PÚBLICA: solo sirve para cifrar. La privada (para leer) está solo en la tarea que carga Logística.
 const VENTAS_PUB = '-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjXpzd2JJYpRkwQbdbFoO\njvgWLfpJ1TuoarrsHmYAQo+zuypOLDf15m5ABY1uHazmARYXCdO7ditx/zOhXPUy\nc1pZyNO3h+u7zdsnrN/7u3VHeZi9qFpaeAq6aw1pWUc1sa2f2Lg8lRTFreIUVMDU\nBn5McrMnsXZrrzFl6ysSDg+DtrfVPHYLj8u/Wsc/GEUB78hPZ6G7cdbayFxOtmBS\n2GxThjzRN2nGiliOd9UGHnBXPZGGRNtsunH6D+tKjGszTITfGKk8lyVoJe/IoAlX\n1tGUKFxsUCP0ZtcOZtWGfd9h6aJEFjtv/t6BfWwq65RG6AvUTRIndBIASmUOo0jW\nbwIDAQAB\n-----END PUBLIC KEY-----';
 const VM_USER = process.env.VM_USER, VM_PASS = process.env.VM_PASS;
-const ADM_USER = process.env.VMADMIN_USER, ADM_PASS = process.env.VMADMIN_PASS;   // la app de administración tiene su propia clave
+// (22-10-2026) La app de administración usa el mismo usuario y clave que la de mantención (dicho por Alejandro).
+// Si algún día se guarda VMADMIN_PASS en GitHub, se usa ese par (VMADMIN_USER + VMADMIN_PASS).
+const ADM_USER = process.env.VMADMIN_PASS ? process.env.VMADMIN_USER : VM_USER;
+const ADM_PASS = process.env.VMADMIN_PASS || VM_PASS;
 const PS_USER = process.env.PAYSCAN_USER, PS_PASS = process.env.PAYSCAN_PASS;
 const LLAVE_PP = process.env.PP_LLAVE;
 
@@ -177,6 +186,60 @@ async function leerAdmin(page) {
   let r;
   while ((r = re.exec(txt))) maq[r[1]] = { online: /^(online|在线|en l)/i.test(r[2]), visto: r[3] };
   return maq;
+}
+
+// ---------- 6) órdenes de la app de administración (tiempos por pedido) ----------
+// Tabla de /orders: "2610221809546174BDSTJ2612002 | CLP$2,790 | Trade success | Nayax | 2026-10-22 15:09:54 | 2026-10-22 15:14:46 | View"
+// Se lee en inglés (localStorage mall_language = en-US) para entender siempre los mismos estados.
+async function leerFilasOrdenes(page) {
+  return page.$$eval('tr', trs => trs.map(t => [...t.querySelectorAll('td')].map(td => (td.innerText || '').trim()))
+    .filter(c => c.length >= 6 && /^\d{10,}/.test(c[0]) && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(c[4])));
+}
+function filaAPedido(c) {
+  const id = (c[0].match(/^\d+/) || [''])[0], sn = c[0].slice(id.length);
+  return { id, m: SERIAL_MAQ[sn] || null, st: c[2], c: c[4], u: c[5] };
+}
+async function abrirOrdenes(page) {
+  await page.goto(VM + '/orders', { waitUntil: 'domcontentloaded' }).catch(() => {});
+  await page.waitForFunction(() => /CLP\$/.test(document.body.innerText) || /^\/login/.test(location.pathname), null, { timeout: 40000 }).catch(() => {});
+  if (esLoginAdmin(page.url())) return false;
+  await page.waitForTimeout(800);
+  return true;
+}
+// paginas: cuántas páginas leer (20 pedidos cada una); hasta: deja de avanzar al llegar a pedidos de antes de esa fecha
+async function leerOrdenesAdmin(browser, dia, paginas, hasta) {
+  let fallo = leerSesion(ADM_FALLO);
+  if (fallo && fallo.dia === dia && fallo.n >= 2) return { salto: 'no entra desde la mañana (2 intentos fallidos hoy); se vuelve a intentar mañana' };
+  const ctx = await browser.newContext({ locale: 'es-CL', timezoneId: 'America/Santiago', viewport: { width: 1366, height: 900 }, storageState: leerSesion(SESION_ADM) });
+  await ctx.addInitScript(() => { try { localStorage.setItem('mall_language', 'en-US'); } catch (e) {} });
+  const page = await ctx.newPage();
+  try {
+    let ok = await abrirOrdenes(page);
+    if (!ok) {
+      console.log('Administración: iniciando sesión');
+      if (await iniciarSesion(page, VM + '/login', ADM_USER, ADM_PASS, esLoginAdmin)) ok = await abrirOrdenes(page);
+      if (!ok) {
+        fallo = fallo && fallo.dia === dia ? fallo : { dia, n: 0 }; fallo.n++; guardarSesion(fallo, ADM_FALLO);
+        await debug(page, 'administracion-login');
+        return { error: 'pidió iniciar sesión y no pude entrar (intento ' + fallo.n + ' de 2 hoy)' };
+      }
+    }
+    const ped = {};
+    for (let i = 0; i < paginas; i++) {
+      const filas = await leerFilasOrdenes(page);
+      let viejo = false;
+      for (const c of filas) { const p = filaAPedido(c); if (p.m) ped[p.id] = p; if (hasta && p.c < hasta) viejo = true; }
+      if (viejo || i === paginas - 1) break;
+      const sig = page.locator('.ant-table-pagination .ant-pagination-next').first();
+      if (!(await sig.count()) || /disabled/.test((await sig.getAttribute('class')) || '')) break;
+      const primero = filas[0] && filas[0][0];
+      await sig.click();
+      await page.waitForFunction(p => { const td = document.querySelector('tr td'); return td && (td.innerText || '').trim() !== p; }, primero, { timeout: 15000 }).catch(() => {});
+      await page.waitForTimeout(400);
+    }
+    guardarSesion(await ctx.storageState(), SESION_ADM);
+    return { ped: Object.values(ped) };
+  } finally { await ctx.close().catch(() => {}); }
 }
 
 // ---------- 4a) stock de papas (pantalla Carriles de la app de mantención) ----------
@@ -388,8 +451,9 @@ async function postear(url, cuerpo, llave) {
     if (mant) informe.mant = mant; else informe.mantError = 'pidió iniciar sesión y no pude entrar';
   } catch (e) { mant = null; informe.mantError = e.message.slice(0, 100); fallas.push('mantención: ' + e.message); }
 
-  // 2) Administración (usuario y clave propios; si no están en GitHub, se salta para no bloquear la cuenta)
-  if (ADM_USER && ADM_PASS) try {
+  // 2) Administración: ya no se lee /operation/devices aquí (descartado el 20-10). Desde el 22-10 se leen sus órdenes
+  //    en una sesión aparte, más abajo (paso 6), para no tocar la sesión de mantención.
+  if (false) try {
     let admin = await leerAdmin(page);
     if (admin === null) {
       console.log('Administración: la sesión venció, iniciando sesión');
@@ -399,7 +463,6 @@ async function postear(url, cuerpo, llave) {
     if (!Object.keys(admin).length) { await debug(page, 'administracion-sin-maquinas'); throw new Error('no encontré máquinas'); }
     informe.admin = admin;
   } catch (e) { informe.adminError = e.message.slice(0, 100); fallas.push('administración: ' + e.message); }
-  else informe.adminError = 'falta guardar su usuario y clave en GitHub';
 
   // 4) Stock y pedidos de hoy (misma sesión de la app de mantención). Nada de esto se escribe en el registro público.
   const extra = { dia: t.dia };
@@ -448,6 +511,24 @@ async function postear(url, cuerpo, llave) {
   if (LLAVE_PP && (extra.stock || extra.pedidos)) {
     const r = await postear(EXTRA, extra, LLAVE_PP).catch(e => ({ status: 0, texto: e.message }));
     console.log(`pp-extra → ${r.status}`);
+  }
+
+  // 6) App de administración, sesión aparte: tiempo de cada pedido. La primera vez carga el historial desde el 11-10.
+  //    En el registro público solo va cuántos pedidos se leyeron.
+  if (LLAVE_PP && ADM_USER && ADM_PASS) {
+    try {
+      const est = await postear(TIEMPOS, { estado: 1 }, LLAVE_PP).catch(() => null);
+      let falta = false; try { falta = !!JSON.parse(est.texto).falta_historial; } catch {}
+      const ad = await leerOrdenesAdmin(browser, t.dia, falta ? 130 : 2, falta ? HIST_DESDE : null);
+      if (ad.ped) {
+        let enviados = 0, st = '';
+        for (let i = 0; i < ad.ped.length; i += 500) {
+          const r = await postear(TIEMPOS, { ped: ad.ped.slice(i, i + 500) }, LLAVE_PP).catch(e => ({ status: 0 }));
+          st = r.status; if (r.status === 200) enviados += Math.min(500, ad.ped.length - i);
+        }
+        console.log('Administración: ' + ad.ped.length + ' pedidos leídos' + (falta ? ' (carga del historial)' : '') + ' · pp-tiempos → ' + st);
+      } else console.log('Administración: ' + (ad.salto || ad.error));
+    } catch (e) { console.log('Administración: ' + e.message.slice(0, 80)); }
   }
 
   // Registro público: solo qué se pudo leer, sin cifras de ventas
