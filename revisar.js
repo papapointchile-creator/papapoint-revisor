@@ -400,19 +400,37 @@ async function leerVentas(page, hoy) {
     if (!res.ok) return { status: res.status };
     const d = await res.json();
     if (!Array.isArray(d)) return { status: 200, raro: true };
-    return { status: 200, tx: d.map(x => [x.date_local, x.kit_id, x.transaction_result, (x.transaction_amount || {}).amount]) };
+    // (22-10-2026) últimos 4 dígitos de la tarjeta: se busca el campo por su nombre (el número nunca se escribe en el registro público)
+    const cuatro = x => {
+      let mejor = null;
+      const ver = (k, v, prof) => {
+        if (v == null) return;
+        if (typeof v === 'object') { if (prof < 2) for (const [k2, v2] of Object.entries(v)) ver(k + '.' + k2, v2, prof + 1); return; }
+        if (/bin|first|primer|amount|monto|id$|_id|date|fecha|kit|serial|auth|code|codigo|exp|venc|cvv|cvc|year|month|holder|name|brand|type|tipo/i.test(k)) return;
+        const p = /last|four|ultim|4/i.test(k) ? 3 : (/mask|pan|card|tarjeta|number|numero/i.test(k) ? 2 : 0);
+        if (!p) return;
+        const m = String(v).match(/(\d{4})\D*$/);
+        if (m && (!mejor || p > mejor.p)) mejor = { p, k, d: m[1] };
+      };
+      for (const [k, v] of Object.entries(x)) ver(k, v, 0);
+      return mejor;
+    };
+    const campos = {};
+    const tx = d.map(x => { const c = cuatro(x); if (c) campos[c.k] = 1; return [x.date_local, x.kit_id, x.transaction_result, (x.transaction_amount || {}).amount, c ? c.d : null]; });
+    return { status: 200, tx, campos: Object.keys(campos) };
   }, { comercio: PS_COMERCIO, q });
+  if (r.campos) console.log('PayScan: últimos 4 dígitos sacados de: ' + (r.campos.join(', ') || 'ningún campo'));
   if (r.status === 401 || r.status === 403) return null;
   if (r.status !== 200) throw new Error('la lista de transacciones respondió ' + r.status);
   if (r.raro) throw new Error('la lista de transacciones cambió de formato');
   // Solo APROBADAS. tx: día → máquina → [[HH:MM, monto], ...]
   const tx = {}, ventas = {};
-  for (const [fecha, kit, res, monto] of r.tx) {
+  for (const [fecha, kit, res, monto, ult4] of r.tx) {
     const m = KIT_MAQ[String(kit)];
     if (!m || res !== 'APPROVED' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(fecha || '')) continue;
     const dia = fecha.slice(0, 10), hm = fecha.slice(11, 16), clp = num(monto);
     if (dia < desde || dia > hoy) continue;
-    ((tx[dia] = tx[dia] || {})[m] = tx[dia][m] || []).push([hm, clp]);
+    ((tx[dia] = tx[dia] || {})[m] = tx[dia][m] || []).push(ult4 ? [hm, clp, ult4] : [hm, clp]);
     if (dia === hoy) { const v = ventas[MAQ_POS[m]] || (ventas[MAQ_POS[m]] = { n: 0, clp: 0 }); v.n++; v.clp += clp; }
   }
   for (const d of Object.values(tx)) for (const l of Object.values(d)) l.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
