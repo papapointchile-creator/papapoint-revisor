@@ -4,7 +4,7 @@
 //  2) App de administración de VM Shopping: en línea y hora de la última conexión.
 //  3) PayScan: lista de transacciones de los últimos 15 días (hora de cada venta), por máquina.
 //  4) App de mantención: stock de papas de cada máquina (Carriles) y pedidos de hoy con su estado (Pedidos).
-//  5) Lo que queda de la corrida (hasta ~4,5 min): mira Pedidos cada 20 s y avisa a pp-envivo.php qué pedido
+//  5) Lo que queda de la corrida (hasta ~3,5 min): mira Pedidos cada 20 s y avisa a pp-envivo.php qué pedido
 //     se está pagando, friendo o esperando que lo saquen ("Máquinas en vivo" lo muestra casi en vivo).
 // Le manda todo a papapoint.cl: pp-alertas.php (alertas y conexión por Telegram, como siempre)
 // y pp-revisor.php (ventas, 2 horas sin vender y la página "Máquinas en vivo" de la intranet).
@@ -25,7 +25,7 @@ const ENVIVO = 'https://www.papapoint.cl/pp-envivo.php'; // pedidos en curso, ca
 const T0 = Date.now();
 // (22-10-2026) Después de leer todo, el revisor se queda mirando la pantalla Pedidos cada 20 s hasta este tope
 // (contado desde que parte el script) y le avisa a la intranet qué pedido se está pagando, friendo o esperando que lo saquen.
-const VIGILAR_HASTA_MS = 4.5 * 60 * 1000;
+const VIGILAR_HASTA_MS = 3.5 * 60 * 1000;   // así la corrida completa dura < 5 min y no atrasa la siguiente (ventas cada 5 min)
 const VIGILAR_CADA_MS = 20 * 1000;
 const PEDIDOS_BIN = '.sesion/pedidos.bin';                // pedidos de hoy ya vistos (cifrados, en el cache)
 const SESION = '.sesion/state.bin';   // sesiones guardadas (cifradas) para no iniciar sesión en cada corrida
