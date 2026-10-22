@@ -16,8 +16,10 @@ concurrency:
 
 jobs:
   revisar:
-    runs-on: ubuntu-latest
-    timeout-minutes: 9   # la corrida se queda ~4,5 min mirando pedidos en curso
+    # (22-10-2026) Fijo en Ubuntu 24.04: "ubuntu-latest" se está pasando a Ubuntu 26 desde el 19-10
+    # y ahí la instalación del navegador se quedaba pegada hasta cortar la corrida (tope de 9 min).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 9   # la corrida se queda ~3,5 min mirando pedidos en curso
     steps:
       - name: ¿Está en horario? (05:45 a 23:30 de Santiago)
         id: hora
@@ -46,14 +48,43 @@ jobs:
           key: sesion-${{ github.run_id }}
           restore-keys: sesion-
 
-      - name: Instalar navegador
+      - name: Instalar Playwright
         if: steps.hora.outputs.activo == '1'
+        id: pw
+        timeout-minutes: 2
         run: |
           npm install --no-save --no-package-lock playwright@1
-          npx playwright install --with-deps chromium
+          echo "version=$(node -p "require('playwright/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # (22-10-2026) El navegador queda guardado en el cache: no se baja de nuevo en cada corrida.
+      - name: Recuperar navegador guardado
+        if: steps.hora.outputs.activo == '1'
+        id: navcache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: navegador-${{ runner.os }}-24.04-${{ steps.pw.outputs.version }}
+
+      - name: Instalar navegador
+        if: steps.hora.outputs.activo == '1'
+        timeout-minutes: 3   # si se pega, se corta aquí y no se come toda la corrida
+        run: |
+          if [ "${{ steps.navcache.outputs.cache-hit }}" = "true" ]; then
+            npx playwright install-deps chromium
+          else
+            npx playwright install --with-deps chromium
+          fi
+
+      - name: Guardar navegador
+        if: steps.hora.outputs.activo == '1' && steps.navcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: navegador-${{ runner.os }}-24.04-${{ steps.pw.outputs.version }}
 
       - name: Revisar máquinas, ventas y avisar
         if: steps.hora.outputs.activo == '1'
+        timeout-minutes: 6
         env:
           VM_USER: ${{ secrets.VM_USER }}
           VM_PASS: ${{ secrets.VM_PASS }}
@@ -78,7 +109,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add estado.json 2>/dev/null || true
           git add ventas.enc 2>/dev/null || true
-          git diff --cached --quiet || (git commit -m "Estado de las máquinas" && git push)
+          git diff --cached --quiet || (git commit -m "Estado de las máquinas" && (git push || (git pull --rebase -q && git push)))
 
       - name: Subir pantallazos si algo falló
         if: failure()
