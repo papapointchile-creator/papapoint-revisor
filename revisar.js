@@ -466,6 +466,21 @@ async function postear(url, cuerpo, llave) {
     }
     if (mant && !Object.keys(mant).length) { await debug(page, 'mantencion-sin-maquinas'); throw new Error('no encontré máquinas'); }
     if (mant && Object.values(mant).some(m => m.online === null)) { await debug(page, 'mantencion-sin-estado'); throw new Error('no entendí si están en línea'); }
+    // (23-10-2026) Confirmar "fuera de línea" antes de creerlo: a veces la app de mantención muestra todas fuera de línea
+    // por unos segundos (pasó el 23-10 a las 11:04, mientras Quinta Normal vendía). Si una máquina que en la corrida anterior
+    // estaba en línea aparece fuera de línea, se vuelve a mirar hasta 2 veces, cada 20 s; si aparece en línea, se toma en línea.
+    if (mant) {
+      let antes = null;
+      try { antes = JSON.parse(fs.readFileSync(ESTADO, 'utf8')).maq || null; } catch {}
+      const dudosas = () => Object.keys(mant).filter(id => mant[id].online === false && !(antes && antes[id] && antes[id].online === false));
+      for (let i = 0; i < 2 && dudosas().length; i++) {
+        await page.waitForTimeout(20000);
+        let otra = null;
+        try { otra = await leerMant(page); } catch {}
+        if (!otra) break;
+        for (const id of dudosas()) if (otra[id] && otra[id].online === true) { console.log('Mantención: ' + id + ' salió fuera de línea y a los ' + (20 * (i + 1)) + ' s estaba en línea'); mant[id] = otra[id]; }
+      }
+    }
     if (mant) informe.mant = mant; else informe.mantError = 'pidió iniciar sesión y no pude entrar';
   } catch (e) { mant = null; informe.mantError = e.message.slice(0, 100); fallas.push('mantención: ' + e.message); }
 
