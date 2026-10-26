@@ -6,6 +6,7 @@
 //  4) App de mantención: stock de papas de cada máquina (Carriles) y pedidos de hoy con su estado (Pedidos).
 //  6) App de administración (sesión aparte): hora de inicio y de término de cada pedido → pp-tiempos.php
 //     (tiempo por pedido en "Máquinas en vivo" y aviso por Telegram si un pedido tarda más de 10 minutos).
+//  7) Entel M2M Manager: chips en sesión y su historial de conexión → pp-entel.php (26-10-2026).
 //  5) Lo que queda de la corrida (hasta ~3,5 min): mira Pedidos cada 20 s y avisa a pp-envivo.php qué pedido
 //     se está pagando, friendo o esperando que lo saquen ("Máquinas en vivo" lo muestra casi en vivo).
 // Le manda todo a papapoint.cl: pp-alertas.php (alertas y conexión por Telegram, como siempre)
@@ -25,6 +26,13 @@ const REVISOR = 'https://www.papapoint.cl/pp-revisor.php';
 const EXTRA = 'https://www.papapoint.cl/pp-extra.php';   // stock y pedidos (21-10-2026)
 const ENVIVO = 'https://www.papapoint.cl/pp-envivo.php'; // pedidos en curso, casi en vivo (22-10-2026)
 const TIEMPOS = 'https://www.papapoint.cl/pp-tiempos.php'; // tiempo de cada pedido, app de administración (22-10-2026)
+const ENTEL = 'https://entel.jasperwireless.com';          // Entel M2M Manager (Cisco Control Center): estado de los chips (26-10-2026)
+const PP_ENTEL = 'https://www.papapoint.cl/pp-entel.php';  // receptor de chips y sesiones en la intranet
+const SESION_ENTEL = '.sesion/entel.bin';
+const ENTEL_FALLO = '.sesion/entel-fallo.bin';
+// Chip (ICCID) de cada máquina, según la matriz de máquinas de la intranet (13-10-2026)
+const SIM_MAQ = { '89560100001409085788': 'M001', '89560100001409085796': 'M002', '89560100001409085804': 'M003' };
+const ENTEL_USER = process.env.ENTEL_USER, ENTEL_PASS = process.env.ENTEL_PASS;
 const SESION_ADM = '.sesion/admin.bin';      // sesión de la app de administración, aparte de la de mantención
 const ADM_FALLO = '.sesion/admin-fallo.bin'; // logins fallidos del día (con 2 se deja de intentar hasta mañana)
 const HIST_DESDE = '2026-10-11';             // primer día de venta al público (para cargar el historial una vez)
@@ -369,6 +377,81 @@ async function vigilarPedidos(page) {
   console.log(`Vigilancia de pedidos: ${vivo.lecturas} lecturas, ${vivo.envios} envíos a la intranet`);
 }
 
+// ---------- 7) Entel M2M Manager: chips (26-10-2026) ----------
+// La página usa una API interna en JSON (la misma que llena sus tablas). Se lee con la sesión del navegador:
+//  - /provision/api/v1/sims → los 10 chips: en sesión, estado, plan, MB del ciclo.
+//  - /provision/api/v1/dataTrafficDetails (por chip instalado) → historial de conexión del ciclo: cada registro
+//    es un tramo con sesión (abre/cierra); un hueco entre tramos = el chip estuvo sin sesión (sin señal o máquina apagada).
+// Con eso la intranet separa "sin conexión por el chip" de "máquina sin responder con el chip conectado".
+// Nada de esto va al registro público (solo cuántos chips se leyeron).
+const esLoginEntel = u => /login\.jsp|\/provision\/login/.test(u);
+async function entelJson(page, ruta) {
+  return page.evaluate(async r => {
+    const q = await fetch(r, { headers: { Accept: 'application/json' }, redirect: 'manual' });
+    if (q.type === 'opaqueredirect' || q.status === 0 || q.status === 401 || q.status === 403) return { login: true };
+    const t = await q.text();
+    try { return { status: q.status, j: JSON.parse(t) }; } catch { return { login: /login/i.test(t) || q.status !== 200, status: q.status }; }
+  }, ruta);
+}
+function cicloEntel(dia) { return `${dia.slice(5, 7)}/01/${dia.slice(0, 4)}`; }   // el ciclo de facturación parte el 1 de cada mes
+async function leerEntel(browser, dia) {
+  let fallo = leerSesion(ENTEL_FALLO);
+  if (fallo && fallo.dia === dia && fallo.n >= 2) return { salto: 'no entra desde la mañana (2 intentos fallidos hoy); se vuelve a intentar mañana' };
+  const ctx = await browser.newContext({ locale: 'es-CL', timezoneId: 'America/Santiago', viewport: { width: 1366, height: 900 }, storageState: leerSesion(SESION_ENTEL) });
+  const page = await ctx.newPage();
+  try {
+    await page.goto(ENTEL + '/provision/ui/m2mhome/m2mhome.html', { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await page.waitForTimeout(1500);
+    let r = esLoginEntel(page.url()) ? { login: true } : await entelJson(page, '/provision/api/v1/sims?page=1&limit=50&sort=dateAdded&dir=DESC');
+    if (r.login) {
+      console.log('Entel: iniciando sesión');
+      if (await iniciarSesion(page, ENTEL + '/provision/jsp/login.jsp', ENTEL_USER, ENTEL_PASS, esLoginEntel)) {
+        await page.waitForTimeout(1500);
+        r = await entelJson(page, '/provision/api/v1/sims?page=1&limit=50&sort=dateAdded&dir=DESC');
+      }
+      if (r.login || !r.j) {
+        fallo = fallo && fallo.dia === dia ? fallo : { dia, n: 0 }; fallo.n++; guardarSesion(fallo, ENTEL_FALLO);
+        await debug(page, 'entel-login');
+        return { error: 'pidió iniciar sesión y no pude entrar (intento ' + fallo.n + ' de 2 hoy)' };
+      }
+    }
+    if (!r.j || !Array.isArray(r.j.data)) throw new Error('la lista de chips cambió de formato');
+    const chips = {}, ses = {};
+    for (const s of r.j.data) {
+      const iccid = String(s.iccid || '');
+      if (!iccid) continue;
+      chips[iccid] = {
+        id: s.simId, msisdn: s.msisdn || null, plan: s.ratePlanName || null,
+        estado: (s.status && (s.status.uploadName || s.status.name)) || s.statusNameDisplay || null,
+        sesion: !!s.inSession, mb: Math.round((+s.monthToDateDataUsageMB || 0) * 10) / 10,
+        activado: s.activationDate ? new Date(s.activationDate).toISOString().slice(0, 10) : null,
+        exceso: !!s.overageLimitReached, bloqueado: !!(s.networkBlocked || s.networkBarred), maq: SIM_MAQ[iccid] || null,
+      };
+    }
+    // Historial de conexión de los chips instalados (ciclo actual y, los primeros días del mes, también el anterior)
+    const ciclos = [cicloEntel(dia)];
+    if (+dia.slice(8, 10) <= 3) ciclos.push(cicloEntel(diaMas(dia, -5)));
+    for (const [iccid, c] of Object.entries(chips)) {
+      if (!c.maq) continue;
+      const tramos = [];
+      for (const ciclo of ciclos) {
+        const q = '/provision/api/v1/dataTrafficDetails?page=1&limit=500&sort=recordOpenTime&dir=DESC&search=' + encodeURIComponent(JSON.stringify([
+          { property: 'simId', type: 'LONG_EQUALS', value: c.id, id: 'simId' },
+          { property: 'billingCycle.cycleStartDate', type: 'BILLDATE_EQUALS', value: ciclo, id: 'cycleStartDate' },
+        ]));
+        const h = await entelJson(page, q);
+        if (!h.j || !Array.isArray(h.j.data)) continue;
+        for (const x of h.j.data) if (x.recordOpenTime) tramos.push([Math.round(x.recordOpenTime / 1000), x.recordCloseTime ? Math.round(x.recordCloseTime / 1000) : null, +x.roundedUsageKB || 0]);
+      }
+      tramos.sort((a, b) => a[0] - b[0]);
+      const lim = Math.round(Date.now() / 1000) - 10 * 86400;   // solo los últimos 10 días (la intranet guarda el historial)
+      ses[c.maq] = tramos.filter(t => (t[1] || t[0]) >= lim);
+    }
+    guardarSesion(await ctx.storageState(), SESION_ENTEL);
+    return { chips, ses };
+  } finally { await ctx.close().catch(() => {}); }
+}
+
 // ---------- 3) PayScan ----------
 const esLoginPs = u => /auth\/login/.test(u);
 const num = s => parseInt(String(s || '').replace(/[^\d]/g, ''), 10) || 0;
@@ -562,6 +645,20 @@ async function postear(url, cuerpo, llave) {
         console.log('Administración: ' + ad.ped.length + ' pedidos leídos' + (falta ? ' (carga del historial)' : '') + ' · pp-tiempos → ' + st);
       } else console.log('Administración: ' + (ad.salto || ad.error));
     } catch (e) { console.log('Administración: ' + e.message.slice(0, 80)); }
+  }
+
+  // 7) Entel M2M: chips y su historial de conexión → pp-entel.php (26-10-2026). Sin ENTEL_USER/ENTEL_PASS se salta.
+  let entelLog = 'sin dato';
+  if (LLAVE_PP && ENTEL_USER && ENTEL_PASS) {
+    try {
+      const en = await leerEntel(browser, t.dia);
+      if (en.chips) {
+        const r = await postear(PP_ENTEL, { u: Math.round(Date.now() / 1000), dia: t.dia, chips: en.chips, ses: en.ses }, LLAVE_PP).catch(e => ({ status: 0 }));
+        const enSesion = Object.values(en.chips).filter(c => c.maq && c.sesion).length, instalados = Object.values(en.chips).filter(c => c.maq).length;
+        entelLog = `${Object.keys(en.chips).length} chips (${enSesion}/${instalados} instalados en sesión) · pp-entel → ${r.status}`;
+      } else entelLog = en.salto || en.error;
+    } catch (e) { entelLog = e.message.slice(0, 80); }
+    console.log('Entel: ' + entelLog);
   }
 
   // Registro público: solo qué se pudo leer, sin cifras de ventas
