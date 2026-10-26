@@ -90,6 +90,8 @@ jobs:
           PAYSCAN_USER: ${{ secrets.PAYSCAN_USER }}
           PAYSCAN_PASS: ${{ secrets.PAYSCAN_PASS }}
           PP_LLAVE: ${{ secrets.PP_LLAVE }}
+          ENTEL_USER: ${{ secrets.ENTEL_USER }}
+          ENTEL_PASS: ${{ secrets.ENTEL_PASS }}
         run: node revisar.js
 
       - name: Guardar sesión
