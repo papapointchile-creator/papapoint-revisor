@@ -281,6 +281,9 @@ async function leerStock(page) {
     // El carril con papas: el primer "Stock" después de FRIES/papas; si no aparece el nombre, el primer Stock
     const papas = bloque.match(/(?:FRIES|PAPA|PATATA)[\s\S]{0,120}?(?:Stock|库存)\s*[:：]\s*(\d+)\s*\/\s*(\d+)/i) || bloque.match(STOCK_RE);
     if (id && papas) stock[id] = { g: +papas[1], max: +papas[2] };
+    // Precio publicado en la tienda en línea (28-10-2026): el último "CLP$N" distinto de 0 de la tarjeta (el ingrediente sale en CLP$0)
+    const precios = [...bloque.matchAll(/CLP\$\s*([\d.,]+)/g)].map(m => +m[1].replace(/[.,]/g, '')).filter(n => n > 0 && n < 100000);
+    if (id && stock[id] && precios.length) stock[id].precio = precios[precios.length - 1];
     await el.click({ timeout: 5000 }).catch(() => {});   // cerrarla para que no se mezcle con la siguiente
     await page.waitForTimeout(400);
   }
