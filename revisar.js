@@ -24,6 +24,7 @@ const PS_COMERCIO = '3194';
 const AVISOS = 'https://www.papapoint.cl/pp-alertas.php';
 const REVISOR = 'https://www.papapoint.cl/pp-revisor.php';
 const EXTRA = 'https://www.papapoint.cl/pp-extra.php';   // stock y pedidos (21-10-2026)
+const TARJ  = 'https://www.papapoint.cl/pp-tarjetas.php';   // (28-10-2026) tarjetas de cada venta, para medir recompra
 const ENVIVO = 'https://www.papapoint.cl/pp-envivo.php'; // pedidos en curso, casi en vivo (22-10-2026)
 const TIEMPOS = 'https://www.papapoint.cl/pp-tiempos.php'; // tiempo de cada pedido, app de administración (22-10-2026)
 const ENTEL = 'https://entel.jasperwireless.com';          // Entel M2M Manager (Cisco Control Center): estado de los chips (26-10-2026)
@@ -502,7 +503,10 @@ async function leerVentas(page, hoy) {
       return mejor;
     };
     const campos = {};
-    const tx = d.map(x => { const c = cuatro(x); if (c) campos[c.k] = 1; return [x.date_local, x.kit_id, x.transaction_result, (x.transaction_amount || {}).amount, c ? c.d : null]; });
+    const tx = d.map(x => { const c = cuatro(x); if (c) campos[c.k] = 1; const cd = x.card || {};
+      // (28-10-2026) BIN + ultimos 4 + marca + debito/credito: en papapoint.cl se guardan SOLO como hash
+      return [x.date_local, x.kit_id, x.transaction_result, (x.transaction_amount || {}).amount, c ? c.d : null,
+              [String(cd.bin || ''), String(cd.pan || ''), String(cd.brand || ''), String(cd.payment_method || '')]]; });
     return { status: 200, tx, campos: Object.keys(campos) };
   }, { comercio: PS_COMERCIO, q });
   if (r.campos) console.log('PayScan: últimos 4 dígitos sacados de: ' + (r.campos.join(', ') || 'ningún campo'));
@@ -510,17 +514,18 @@ async function leerVentas(page, hoy) {
   if (r.status !== 200) throw new Error('la lista de transacciones respondió ' + r.status);
   if (r.raro) throw new Error('la lista de transacciones cambió de formato');
   // Solo APROBADAS. tx: día → máquina → [[HH:MM, monto], ...]
-  const tx = {}, ventas = {};
-  for (const [fecha, kit, res, monto, ult4] of r.tx) {
+  const tx = {}, ventas = {}, tarjetas = {};
+  for (const [fecha, kit, res, monto, ult4, tarj] of r.tx) {
     const m = KIT_MAQ[String(kit)];
     if (!m || res !== 'APPROVED' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(fecha || '')) continue;
     const dia = fecha.slice(0, 10), hm = fecha.slice(11, 16), clp = num(monto);
     if (dia < desde || dia > hoy) continue;
     ((tx[dia] = tx[dia] || {})[m] = tx[dia][m] || []).push(ult4 ? [hm, clp, ult4] : [hm, clp]);
+    if (tarj && (tarj[0] || tarj[1])) ((tarjetas[dia] = tarjetas[dia] || {})[m] = tarjetas[dia][m] || []).push(tarj);
     if (dia === hoy) { const v = ventas[MAQ_POS[m]] || (ventas[MAQ_POS[m]] = { n: 0, clp: 0 }); v.n++; v.clp += clp; }
   }
   for (const d of Object.values(tx)) for (const l of Object.values(d)) l.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
-  return { ventas, tx, desde };
+  return { ventas, tx, tarjetas, desde };
 }
 
 async function postear(url, cuerpo, llave) {
@@ -603,6 +608,7 @@ async function postear(url, cuerpo, llave) {
   }
 
   // 3) PayScan (sin pantallazos: mostrarían ventas)
+  let lote_tarjetas = null;
   try {
     let lv = await leerVentas(page, t.dia);
     if (lv === null) {
@@ -612,6 +618,7 @@ async function postear(url, cuerpo, llave) {
     }
     informe.ventas = lv.ventas; informe.ventasDia = t.dia;
     informe.tx = lv.tx; informe.txDesde = lv.desde;
+    lote_tarjetas = lv.tarjetas;
   } catch (e) { informe.ventasError = e.message.slice(0, 100); fallas.push('PayScan: ' + e.message); }
 
   guardarSesion(await ctx.storageState());
@@ -630,6 +637,13 @@ async function postear(url, cuerpo, llave) {
   if (LLAVE_PP && (extra.stock || extra.pedidos)) {
     const r = await postear(EXTRA, extra, LLAVE_PP).catch(e => ({ status: 0, texto: e.message }));
     console.log(`pp-extra → ${r.status}`);
+  }
+  // (28-10-2026) Tarjetas de cada venta → pp-tarjetas.php, que guarda SOLO un hash con sal secreta.
+  // En el registro público va únicamente cuántas se mandaron, nunca los datos.
+  if (LLAVE_PP && lote_tarjetas && Object.keys(lote_tarjetas).length) {
+    const n = Object.values(lote_tarjetas).reduce((s, d) => s + Object.values(d).reduce((a, l) => a + l.length, 0), 0);
+    const r = await postear(TARJ, { lote: lote_tarjetas }, LLAVE_PP).catch(e => ({ status: 0, texto: e.message }));
+    console.log(`pp-tarjetas → ${r.status} (${n} ventas de ${Object.keys(lote_tarjetas).length} dias)`);
   }
 
   // 6) App de administración, sesión aparte: tiempo de cada pedido. La primera vez carga el historial desde el 11-10.
