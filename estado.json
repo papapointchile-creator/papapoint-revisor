@@ -1,16 +1,16 @@
 {
   "dia": "2026-10-30",
-  "desde": "18:22:46",
+  "desde": "18:30:22",
   "maq": {
+    "M003": {
+      "online": true,
+      "alerta": null
+    },
     "M001": {
       "online": true,
       "alerta": null
     },
     "M002": {
-      "online": true,
-      "alerta": null
-    },
-    "M003": {
       "online": true,
       "alerta": null
     }
