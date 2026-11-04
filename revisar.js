@@ -26,6 +26,7 @@ const REVISOR = 'https://www.papapoint.cl/pp-revisor.php';
 const EXTRA = 'https://www.papapoint.cl/pp-extra.php';   // stock y pedidos (21-10-2026)
 const TARJ  = 'https://www.papapoint.cl/pp-tarjetas.php';   // (28-10-2026) tarjetas de cada venta, para medir recompra
 const ENVIVO = 'https://www.papapoint.cl/pp-envivo.php'; // pedidos en curso, casi en vivo (22-10-2026)
+const EQUIPO = 'https://www.papapoint.cl/intranet/pp-equipo-tarjetas.php';   // (04-11-2026) compras con tarjetas del equipo: no son ventas ni clientes
 const TIEMPOS = 'https://www.papapoint.cl/pp-tiempos.php'; // tiempo de cada pedido, app de administración (22-10-2026)
 const ENTEL = 'https://entel.jasperwireless.com';          // Entel M2M Manager (Cisco Control Center): estado de los chips (26-10-2026)
 const PP_ENTEL = 'https://www.papapoint.cl/pp-entel.php';  // receptor de chips y sesiones en la intranet
@@ -472,14 +473,12 @@ function desfaseSantiago() {   // horas que Santiago está detrás de UTC (3 en 
   const local = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour % 24, +p.minute);
   return Math.round((Date.now() - local) / 3600000);
 }
-async function leerVentas(page, hoy) {
-  await page.goto(`${PS}/#/transactions?commerce_id=${PS_COMERCIO}`, { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(4000);
-  if (esLoginPs(page.url())) return null;
+// Lista de transacciones de PayScan entre dos días (hora de Santiago), con la página ya abierta en PayScan.
+// (04-11-2026) separada de leerVentas para poder pedir un rango más largo (historial de las tarjetas del equipo).
+async function txPayScan(page, desde, hasta) {
   const off = desfaseSantiago(), hh = n => String(n).padStart(2, '0');
-  const desde = diaMas(hoy, -(DIAS_TX - 1));
-  const q = `date_start=${desde}T${hh(off)}:00:00&date_end=${diaMas(hoy, 1)}T${hh(off - 1)}:59:59&offset=${off}`;
-  const r = await page.evaluate(async ({ comercio, q }) => {
+  const q = `date_start=${desde}T${hh(off)}:00:00&date_end=${diaMas(hasta, 1)}T${hh(off - 1)}:59:59&offset=${off}`;
+  return await page.evaluate(async ({ comercio, q }) => {
     let tk = sessionStorage.getItem('token');
     if (!tk) return { status: 401 };
     try { const j = JSON.parse(tk); if (typeof j === 'string') tk = j; } catch {}
@@ -509,6 +508,13 @@ async function leerVentas(page, hoy) {
               [String(cd.bin || ''), String(cd.pan || ''), String(cd.brand || ''), String(cd.payment_method || '')]]; });
     return { status: 200, tx, campos: Object.keys(campos) };
   }, { comercio: PS_COMERCIO, q });
+}
+async function leerVentas(page, hoy) {
+  await page.goto(`${PS}/#/transactions?commerce_id=${PS_COMERCIO}`, { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(4000);
+  if (esLoginPs(page.url())) return null;
+  const desde = diaMas(hoy, -(DIAS_TX - 1));
+  const r = await txPayScan(page, desde, hoy);
   if (r.campos) console.log('PayScan: últimos 4 dígitos sacados de: ' + (r.campos.join(', ') || 'ningún campo'));
   if (r.status === 401 || r.status === 403) return null;
   if (r.status !== 200) throw new Error('la lista de transacciones respondió ' + r.status);
@@ -525,7 +531,26 @@ async function leerVentas(page, hoy) {
     if (dia === hoy) { const v = ventas[MAQ_POS[m]] || (ventas[MAQ_POS[m]] = { n: 0, clp: 0 }); v.n++; v.clp += clp; }
   }
   for (const d of Object.values(tx)) for (const l of Object.values(d)) l.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0);
-  return { ventas, tx, tarjetas, desde };
+  return { ventas, tx, tarjetas, desde, crudo: r.tx };
+}
+
+// (04-11-2026) Compras aprobadas con tarjetas del equipo: [día, HH:MM, máquina, monto, últimos 4, [bin, pan, marca, método]]
+function comprasEquipo(crudo, cuatros, desde, hasta) {
+  const out = [];
+  for (const [fecha, kit, res, monto, ult4, tarj] of crudo || []) {
+    const m = KIT_MAQ[String(kit)];
+    if (!m || res !== 'APPROVED' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(fecha || '')) continue;
+    const dia = fecha.slice(0, 10);
+    if (dia < desde || dia > hasta) continue;
+    const c = ult4 || (String((tarj || [])[1] || '').match(/(\d{4})\D*$/) || [])[1];
+    if (c && cuatros.has(c)) out.push([dia, fecha.slice(11, 16), m, num(monto), c, tarj || []]);
+  }
+  return out;
+}
+async function obtener(url, llave) {
+  const r = await fetch(url, { headers: { 'User-Agent': 'PapaPoint-Revisor/2.0', 'X-PP-Llave': llave } });
+  if (!r.ok) return null;
+  try { return await r.json(); } catch { return null; }
 }
 
 async function postear(url, cuerpo, llave) {
@@ -608,7 +633,7 @@ async function postear(url, cuerpo, llave) {
   }
 
   // 3) PayScan (sin pantallazos: mostrarían ventas)
-  let lote_tarjetas = null;
+  let lote_tarjetas = null, lote_crudo = null;
   try {
     let lv = await leerVentas(page, t.dia);
     if (lv === null) {
@@ -618,8 +643,29 @@ async function postear(url, cuerpo, llave) {
     }
     informe.ventas = lv.ventas; informe.ventasDia = t.dia;
     informe.tx = lv.tx; informe.txDesde = lv.desde;
-    lote_tarjetas = lv.tarjetas;
+    lote_tarjetas = lv.tarjetas; lote_crudo = lv.crudo;
   } catch (e) { informe.ventasError = e.message.slice(0, 100); fallas.push('PayScan: ' + e.message); }
+
+  // (04-11-2026) Tarjetas del equipo (la lista vive en la intranet, no en este repo público): sus compras se descuentan
+  // de las ventas y se sacan de la recompra. Si la lista es nueva o cambió, se trae todo el historial desde el 11-10.
+  // En el registro público solo va cuántas compras se encontraron.
+  if (LLAVE_PP && informe.ventas && informe.txDesde) {
+    try {
+      const cfg = await obtener(EQUIPO, LLAVE_PP);
+      if (cfg && Array.isArray(cfg.c) && cfg.c.length) {
+        const cuatros = new Set(cfg.c.map(String));
+        let crudo = lote_crudo, desde = informe.txDesde, hist = false;
+        if (cfg.falta_hist && /^\d{4}-\d\d-\d\d$/.test(cfg.desde || '') && cfg.desde < desde) {
+          const h = await txPayScan(page, cfg.desde, t.dia).catch(() => null);
+          if (h && h.status === 200 && Array.isArray(h.tx)) { crudo = h.tx; desde = cfg.desde; hist = true; }
+          else console.log('Equipo: no pude traer el historial (' + (h ? h.status : 'error') + '), sigo con los últimos días');
+        } else if (cfg.falta_hist) hist = true;
+        const tx = comprasEquipo(crudo, cuatros, desde, t.dia);
+        const r = await postear(EQUIPO, { desde, hasta: t.dia, hist, tx }, LLAVE_PP).catch(e => ({ status: 0 }));
+        console.log(`pp-equipo → ${r.status} (${tx.length} compras del equipo desde ${desde}${hist ? ', con historial' : ''})`);
+      }
+    } catch (e) { console.log('Equipo: ' + e.message.slice(0, 80)); }
+  }
 
   guardarSesion(await ctx.storageState());
 
