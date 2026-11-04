@@ -24,6 +24,7 @@ const PS_COMERCIO = '3194';
 const AVISOS = 'https://www.papapoint.cl/pp-alertas.php';
 const REVISOR = 'https://www.papapoint.cl/pp-revisor.php';
 const EXTRA = 'https://www.papapoint.cl/pp-extra.php';   // stock y pedidos (21-10-2026)
+const RECH  = 'https://www.papapoint.cl/intranet/pp-rechazos.php';   // (04-11-2026) pagos NO aprobados (banco, PIN, lector, reversos) para el Embudo de pago
 const TARJ  = 'https://www.papapoint.cl/pp-tarjetas.php';   // (28-10-2026) tarjetas de cada venta, para medir recompra
 const ENVIVO = 'https://www.papapoint.cl/pp-envivo.php'; // pedidos en curso, casi en vivo (22-10-2026)
 const EQUIPO = 'https://www.papapoint.cl/intranet/pp-equipo-tarjetas.php';   // (04-11-2026) compras con tarjetas del equipo: no son ventas ni clientes
@@ -504,8 +505,11 @@ async function txPayScan(page, desde, hasta) {
     const campos = {};
     const tx = d.map(x => { const c = cuatro(x); if (c) campos[c.k] = 1; const cd = x.card || {};
       // (28-10-2026) BIN + ultimos 4 + marca + debito/credito: en papapoint.cl se guardan SOLO como hash
+      // (04-11-2026) categoría de los NO aprobados: N sin fondos · P PIN · O otro rechazo · F falla del lector/POS · R reversado
+      const res = String(x.transaction_result || ''), msg = String(x.transaction_message || '') + ' ' + String(x.device_message || '');
+      const cat = res === 'APPROVED' ? '' : res === 'FAILED' ? 'F' : res === 'REVERSED' ? 'R' : /PIN/i.test(msg) ? 'P' : /fund/i.test(msg) ? 'N' : 'O';
       return [x.date_local, x.kit_id, x.transaction_result, (x.transaction_amount || {}).amount, c ? c.d : null,
-              [String(cd.bin || ''), String(cd.pan || ''), String(cd.brand || ''), String(cd.payment_method || '')]]; });
+              [String(cd.bin || ''), String(cd.pan || ''), String(cd.brand || ''), String(cd.payment_method || '')], cat]; });
     return { status: 200, tx, campos: Object.keys(campos) };
   }, { comercio: PS_COMERCIO, q });
 }
@@ -665,6 +669,30 @@ async function postear(url, cuerpo, llave) {
         console.log(`pp-equipo → ${r.status} (${tx.length} compras del equipo desde ${desde}${hist ? ', con historial' : ''})`);
       }
     } catch (e) { console.log('Equipo: ' + e.message.slice(0, 80)); }
+  }
+
+  // (04-11-2026) Pagos NO aprobados → pp-rechazos.php (Embudo de pago en Máquinas en vivo). La primera vez trae todo desde el 11-10.
+  // En el registro público solo va cuántos se mandaron.
+  if (LLAVE_PP && lote_crudo && informe.txDesde) {
+    try {
+      const cfg = await obtener(RECH, LLAVE_PP);
+      if (cfg) {
+        let crudo = lote_crudo, desde = informe.txDesde;
+        if (cfg.falta_hist && /^\d{4}-\d\d-\d\d$/.test(cfg.desde || '') && cfg.desde < desde) {
+          const h = await txPayScan(page, cfg.desde, t.dia).catch(() => null);
+          if (h && h.status === 200 && Array.isArray(h.tx)) { crudo = h.tx; desde = cfg.desde; }
+        }
+        const r = [];
+        for (const x of crudo || []) {
+          const m = KIT_MAQ[String(x[1])], cat = x[6];
+          if (!m || !cat || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d/.test(x[0] || '')) continue;
+          const dia = x[0].slice(0, 10); if (dia < desde || dia > t.dia) continue;
+          r.push([x[0].slice(0, 19), m, cat, x[4] || '']);
+        }
+        const q = await postear(RECH, { desde, hasta: t.dia, r }, LLAVE_PP).catch(e => ({ status: 0 }));
+        console.log(`pp-rechazos → ${q.status} (${r.length} pagos no aprobados desde ${desde})`);
+      }
+    } catch (e) { console.log('Rechazos: ' + e.message.slice(0, 80)); }
   }
 
   guardarSesion(await ctx.storageState());
